@@ -1,0 +1,25 @@
+# subs-check 配置
+
+mihomo:
+  binary: bin/mihomo
+  config_path: config/mihomo.yaml
+  external_controller: 127.0.0.1:9090
+  secret: ""
+  log_level: info
+
+probe:
+  interval_sec: 60
+  fast_interval_sec: 10
+  timeout_ms: 5000
+  concurrency: 20
+  probe_url: "https://www.gstatic.com/generate_204"
+
+model:
+  model_path: models/ranker.lgb
+  feature_window_min: 30
+  model_weight: 0.7
+  realtime_weight: 0.3
+
+selector:
+  top_n: 3
+  min_score: 0.5

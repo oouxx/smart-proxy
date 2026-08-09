@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Go
+go/bin/
+*.exe
+
+# 模型与产物
+models/
+bin/
+output/
+
+# 环境
+.env
+
+# 文档
+docs
+
+# config
+config/mihomo.yaml
