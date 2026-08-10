@@ -43,6 +43,8 @@ class ModelConfig:
     feature_window_min: int = 30
     model_weight: float = 0.7       # 模型评分权重
     realtime_weight: float = 0.3    # 实时评分权重
+    auto_train: bool = False        # collect 是否自动重训模型
+    auto_train_interval_hours: int = 72  # 自动重训间隔 (小时)
 
 
 @dataclass
@@ -81,6 +83,8 @@ class CollectConfig:
     """定时批处理采集配置。"""
 
     output: str = "data/features.csv"  # 特征数据 CSV 输出路径 (每小时追加)
+    retention_days: int = 14            # 特征数据保留期 (天)，超过则清理
+    schedule: str = "0 * * * *"         # cron 表达式，serve 内定时跑 collect
 
 
 @dataclass

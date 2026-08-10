@@ -29,9 +29,10 @@ def test_inject_from_source_adds_new_nodes(tmp_path):
 
     added = pool.inject_from_source(NodeSourceConfig(path=str(src)))
     assert added == 1
-    assert mgr.get("us-1") is not None
-    assert mgr.get("us-1").protocol == "trojan"
-    assert mgr.get("us-1").server == "2.2.2.2"
+    us1 = mgr.get("us-1")
+    assert us1 is not None
+    assert us1.protocol == "trojan"
+    assert us1.server == "2.2.2.2"
 
 
 def test_inject_missing_source_returns_zero(tmp_path):

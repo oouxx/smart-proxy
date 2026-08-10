@@ -54,6 +54,16 @@ class FeatureEngine:
             "country": self._country_code(node.country),
             "protocol": self._protocol_code(node.protocol),
         }
+        # 交互特征: 组合延迟与丢包/成功率，捕捉联合影响
+        latency_avg = feats["latency_avg_5m"]
+        if latency_avg > 0:
+            feats["latency_loss_interaction"] = latency_avg * feats["loss_rate_30m"]
+            feats["latency_success_interaction"] = latency_avg * (
+                1.0 - feats["success_rate"]
+            )
+        else:
+            feats["latency_loss_interaction"] = 0.0
+            feats["latency_success_interaction"] = 0.0
         return feats
 
     def _empty_features(self, node: ProxyNode) -> dict[str, float]:
@@ -71,6 +81,8 @@ class FeatureEngine:
             "time_hour": float(pd.Timestamp.now().hour),
             "country": self._country_code(node.country),
             "protocol": self._protocol_code(node.protocol),
+            "latency_loss_interaction": 0.0,
+            "latency_success_interaction": 0.0,
         }
 
     @staticmethod
@@ -106,4 +118,6 @@ class FeatureEngine:
             "time_hour",
             "country",
             "protocol",
+            "latency_loss_interaction",
+            "latency_success_interaction",
         ]

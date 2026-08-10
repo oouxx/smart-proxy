@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import logging
+import math
+import time
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -48,15 +51,21 @@ class NodeRanker:
             ],
             columns=self.features.feature_names(),
         )
-        scores = self._model.predict(X)
+        scores = np.asarray(self._model.predict(X))
         return [float(np.clip(s, 0.0, 1.0)) for s in scores]
 
-    def train(self, X, y, feature_names=None) -> None:
+    def train(
+        self,
+        X: Any,
+        y: Any,
+        feature_names: list[str] | None = None,
+    ) -> None:
         """训练 LightGBM 回归模型 (预测节点质量分数 0~1)。
 
-        X: 特征矩阵 (n_samples, n_features)
+        X: 特征矩阵 (LightGBM 兼容的 ndarray/DataFrame/list)
         y: 质量标签 (0~1)
-        feature_names: 特征名列表 (用于特征重要性)
+        feature_names: 特征名列表 (用于特征重要性)；为 None 时由 LightGBM
+                       从 DataFrame 列名自动推断。
         """
         try:
             import lightgbm as lgb
@@ -73,7 +82,11 @@ class NodeRanker:
             random_state=42,
             verbose=-1,
         )
-        model.fit(X, y, feature_name=feature_names)
+        # feature_name 不接受 None (只接受 list 或 "auto")
+        if feature_names is not None:
+            model.fit(X, y, feature_name=feature_names)
+        else:
+            model.fit(X, y)
         self._model = model
         Path(self.cfg.model_path).parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, self.cfg.model_path)
@@ -100,7 +113,10 @@ def quality_label(result: ProbeResult) -> float:
 
 
 class RealtimeScorer:
-    """实时评分，补充机器学习结果。"""
+    """实时评分，补充机器学习结果。
+
+    含智能惩罚: 连续失败越多惩罚越大 (非线性)，失败越严重降权越明显。
+    """
 
     def score(
         self,
@@ -108,6 +124,7 @@ class RealtimeScorer:
         speed_kbps: float | None,
         success_rate: float,
         failure_count: int,
+        consecutive_failures: int = 0,
     ) -> float:
         """实时评分 (0~1)。"""
         score = 0.0
@@ -118,7 +135,9 @@ class RealtimeScorer:
             # 速度越高越好，10Mbps 以上满分
             score += 0.3 * min(1.0, speed_kbps / 10_000.0)
         score += 0.2 * success_rate
-        score -= 0.1 * min(1.0, failure_count / 10.0)
+        # 智能惩罚: 连续失败越多惩罚越大 (非线性)，失败越严重降权越明显
+        penalty = 0.15 * (1.0 - math.exp(-consecutive_failures / 2.0))
+        score -= penalty
         return float(np.clip(score, 0.0, 1.0))
 
 
@@ -139,7 +158,12 @@ class IntelligenceEngine:
         """对单个节点计算最终评分 (0~1)。
 
         完整链路: 探测历史 -> 特征 -> 模型预测 (LightGBM)
-                  + 实时评分 -> 按权重融合。
+                  + 实时评分 -> 按权重融合 -> 时间衰减。
+
+        特性:
+        - EMA 平滑: 实时指标用指数移动平均，近期数据权重更高
+        - 智能惩罚: 连续失败越多，实时分惩罚越大 (非线性)
+        - 时间衰减: 长时间未探测的节点降权
         """
         feats = self.ranker.features.build_features(node, history)
         model_score = self.ranker.predict([feats])[0]
@@ -148,15 +172,48 @@ class IntelligenceEngine:
             # 无历史数据: 仅用属性特征得出的模型分 + 空实时分
             return self.final_score(model_score, 0.0)
 
-        # 实时分: 取历史窗口的聚合指标
+        # 实时分: 用 EMA 平滑历史窗口的聚合指标 (近期权重更高)
         latencies = [r.latency_ms for r in history if r.latency_ms is not None]
         speeds = [r.download_speed_kbps for r in history if r.download_speed_kbps is not None]
         success_count = sum(1 for r in history if r.success)
         latest = history[-1]
+        # 连续失败次数 (从最近往前的连续失败)
+        consecutive_failures = 0
+        for r in reversed(history):
+            if r.success:
+                break
+            consecutive_failures += 1
+
         realtime_score = self.scorer.score(
-            latency_ms=float(np.mean(latencies)) if latencies else latest.latency_ms,
-            speed_kbps=float(np.mean(speeds)) if speeds else latest.download_speed_kbps,
+            latency_ms=self._ema(latencies) if latencies else latest.latency_ms,
+            speed_kbps=self._ema(speeds) if speeds else latest.download_speed_kbps,
             success_rate=success_count / len(history),
             failure_count=len(history) - success_count,
+            consecutive_failures=consecutive_failures,
         )
-        return self.final_score(model_score, realtime_score)
+        score = self.final_score(model_score, realtime_score)
+        # 时间衰减: 长时间未探测的节点降权
+        return score * self._time_decay(history)
+
+    @staticmethod
+    def _ema(values: list[float], alpha: float = 0.5) -> float:
+        """指数移动平均 (近期数据权重更高，平滑异常波动)。"""
+        if not values:
+            return 0.0
+        ema = values[0]
+        for v in values[1:]:
+            ema = alpha * v + (1 - alpha) * ema
+        return ema
+
+    @staticmethod
+    def _time_decay(history: list[ProbeResult]) -> float:
+        """时间衰减因子: 超过 7 天未探测的节点权重逐渐降低。"""
+        if not history:
+            return 1.0
+        last_ts = history[-1].timestamp
+        days = (time.time() - last_ts) / 86400.0
+        decay_days = 7.0
+        if days <= decay_days:
+            return 1.0
+        # λ=1/30: 超过 7 天后每 30 天衰减约 e 倍
+        return math.exp(-(days - decay_days) / 30.0)

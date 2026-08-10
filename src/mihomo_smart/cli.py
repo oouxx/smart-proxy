@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 _BAD_AFTER_FAILURES = 3
 # 连续失败多少次判定为死节点 (降级到 DEAD，随后被动态池淘汰)
 _DEAD_AFTER_FAILURES = 10
+# 分阶段恢复: BAD 节点成功后再连续成功多少次才回 ACTIVE
+_RECOVERY_SUCCESSES = 3
 
 
 def _bandit_reward(history: list) -> float:
@@ -57,7 +59,16 @@ def _apply_node_status(nodes, probe) -> None:
             nodes.set_status(node.node_id, NodeStatus.PROBING)
         elif node.status in (NodeStatus.PROBING, NodeStatus.BAD):
             if latest.success:
-                nodes.set_status(node.node_id, NodeStatus.ACTIVE)
+                if node.status == NodeStatus.BAD:
+                    # 分阶段恢复: BAD 成功先进入 PROBING 试探
+                    nodes.set_status(node.node_id, NodeStatus.PROBING)
+                else:
+                    # PROBING 连续成功 _RECOVERY_SUCCESSES 次后回 ACTIVE
+                    recent = history[-_RECOVERY_SUCCESSES:]
+                    if len(recent) >= _RECOVERY_SUCCESSES and all(
+                        r.success for r in recent
+                    ):
+                        nodes.set_status(node.node_id, NodeStatus.ACTIVE)
             elif len(history) >= _DEAD_AFTER_FAILURES and all(
                 not r.success for r in history[-_DEAD_AFTER_FAILURES:]
             ):
@@ -330,6 +341,151 @@ def _append_csv(path: str, rows: list[dict], feature_names: list[str]) -> None:
     os.replace(tmp, out)
 
 
+def _prune_csv(path: str, retention_days: int) -> int:
+    """清理超过保留期的特征数据 (按 timestamp 列)。返回移除的行数。"""
+    import os
+    from datetime import datetime
+    from pathlib import Path
+
+    out = Path(path)
+    if not out.exists():
+        return 0
+    cutoff = time.time() - retention_days * 86400
+
+    def _row_ts(ts: str) -> float:
+        try:
+            # 时间戳以本地时间写入，按本地时区解释 (有意的 naive datetime)
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp()  # noqa: DTZ007
+        except (ValueError, TypeError):
+            return 0.0
+
+    with open(out, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        if fieldnames is None:
+            return 0  # 空文件或异常，跳过清理
+        all_rows = list(reader)
+    kept = [r for r in all_rows if _row_ts(r.get("timestamp", "")) >= cutoff]
+    removed = len(all_rows) - len(kept)
+    if removed:
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        with open(tmp, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(kept)
+        os.replace(tmp, out)
+        logger.info("数据保留期清理: 移除 %d 行 (保留 %d 行)", removed, len(kept))
+    return removed
+
+
+def _should_retrain(model_path: str, interval_hours: int) -> bool:
+    """判断是否需要自动重训模型 (模型不存在或超过间隔)。"""
+    from pathlib import Path
+
+    p = Path(model_path)
+    if not p.exists():
+        return True
+    age_hours = (time.time() - p.stat().st_mtime) / 3600
+    return age_hours >= interval_hours
+
+
+async def run_collect(cfg, out_path: str | None = None) -> None:
+    """collect 核心逻辑: 探测 -> 特征 -> 追加 CSV -> 更新 Bandit。
+
+    可被 collect 命令直接调用，也可被 serve 内的 cron 调度器定时调用。
+    """
+    from .core.node_manager import NodeManager, ProxyNode
+    from .core.node_source import load_nodes
+    from .core.probe import ProbeEngine
+    from .ml.bandit import BanditLearner
+    from .ml.features import FeatureEngine
+    from .ml.model import IntelligenceEngine, NodeRanker, RealtimeScorer, quality_label
+
+    out_path = out_path or cfg.collect.output
+
+    # 1. 读取节点源 (to_thread 避免同步 HTTP 阻塞事件循环)
+    nodes = await asyncio.to_thread(load_nodes, cfg.node_source)
+    logger.info("节点源加载 %d 个节点", len(nodes))
+
+    # 2. 批量探测 (probe-engine 内嵌 mihomo 隧道)
+    engine = ProbeEngine(cfg.probe, NodeManager())
+    await engine.start_engine()
+    try:
+        results = await engine.probe_all(nodes)
+    finally:
+        await engine.stop_engine()
+
+    # 3. 特征 + 评分 + Bandit 在线学习
+    features = FeatureEngine()
+    ranker = NodeRanker(cfg.model, features)
+    ranker.load()
+    scorer = RealtimeScorer()
+    intelligence = IntelligenceEngine(cfg.model, ranker, scorer)
+    bandit = BanditLearner(
+        alpha=cfg.bandit.alpha,
+        exploration_rate=cfg.bandit.exploration_rate,
+        min_selections=cfg.bandit.min_selections,
+    )
+    bandit.load(cfg.bandit.state_path)
+
+    # 先收集所有节点数据并更新 Bandit，避免 zip 静默截断
+    pending: list[tuple[ProxyNode, dict, float, float]] = []
+    X_train: list[list[float]] = []
+    y_train: list[float] = []
+    for node_cfg, result in zip_longest(nodes, results):
+        if result is None:
+            logger.warning("节点 %s 无探测结果，跳过", node_cfg.get("name"))
+            continue
+        node = ProxyNode(
+            node_id=result.node_id,
+            server="",
+            port=0,
+            protocol=str(node_cfg.get("type", "unknown")).lower(),
+            country=node_cfg.get("country", ""),
+        )
+        feats = features.build_features(node, [result])
+        score = intelligence.score_node(node, [result])
+        reward = _bandit_reward([result])
+        bandit.update(result.node_id, reward)
+        pending.append((node, feats, score, reward))
+        # 收集训练样本 (用于模型自动更新)
+        X_train.append([feats[name] for name in features.feature_names()])
+        y_train.append(quality_label(result))
+
+    # 全部 update 完再统一计算 UCB 分数 (保证基准一致)
+    rows: list[dict] = []
+    for node, feats, score, reward in pending:
+        rows.append(
+            {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "node_id": node.node_id,
+                "protocol_name": node.protocol,
+                "country_name": node.country,
+                **feats,
+                "score": round(score, 4),
+                "bandit_reward": round(reward, 4),
+                "bandit_ucb_score": round(bandit.ucb_score(node.node_id), 4),
+            }
+        )
+
+    # 4. 追加到 CSV + 数据保留期清理 + 持久化 Bandit 状态
+    _append_csv(out_path, rows, features.feature_names())
+    _prune_csv(out_path, cfg.collect.retention_days)
+    bandit.save(cfg.bandit.state_path)
+
+    # 5. 模型自动更新 (可选)
+    if cfg.model.auto_train and _should_retrain(
+        cfg.model.model_path, cfg.model.auto_train_interval_hours
+    ):
+        if len(X_train) >= 10:
+            ranker.train(X_train, y_train, feature_names=features.feature_names())
+            logger.info("模型自动重训完成 (%d 个样本)", len(X_train))
+        else:
+            logger.info("样本不足 (%d)，跳过自动重训", len(X_train))
+
+    logger.info("完成: %d 个节点特征已追加到 %s (Bandit 已更新)", len(rows), out_path)
+
+
 @cli.command()
 @click.pass_context
 @click.option("--output", default=None, help="覆盖配置中的特征 CSV 输出路径")
@@ -338,97 +494,37 @@ def collect(ctx: click.Context, output: str | None) -> None:
 
     供 cron 每小时调用一次，累积特征数据并持续在线学习。
     """
-    from .core.node_manager import NodeManager, ProxyNode
-    from .core.node_source import load_nodes
-    from .core.probe import ProbeEngine
-    from .ml.bandit import BanditLearner
-    from .ml.features import FeatureEngine
-    from .ml.model import IntelligenceEngine, NodeRanker, RealtimeScorer
-
     cfg = ctx.obj["config"]
-    out_path = output or cfg.collect.output
-
-    async def _collect() -> None:
-        # 1. 读取节点源 (to_thread 避免同步 HTTP 阻塞事件循环)
-        nodes = await asyncio.to_thread(load_nodes, cfg.node_source)
-        logger.info("节点源加载 %d 个节点", len(nodes))
-
-        # 2. 批量探测 (probe-engine 内嵌 mihomo 隧道)
-        engine = ProbeEngine(cfg.probe, NodeManager())
-        await engine.start_engine()
-        try:
-            results = await engine.probe_all(nodes)
-        finally:
-            await engine.stop_engine()
-
-        # 3. 特征 + 评分 + Bandit 在线学习
-        features = FeatureEngine()
-        ranker = NodeRanker(cfg.model, features)
-        ranker.load()
-        scorer = RealtimeScorer()
-        intelligence = IntelligenceEngine(cfg.model, ranker, scorer)
-        bandit = BanditLearner(
-            alpha=cfg.bandit.alpha,
-            exploration_rate=cfg.bandit.exploration_rate,
-            min_selections=cfg.bandit.min_selections,
-        )
-        bandit.load(cfg.bandit.state_path)
-
-        # 先收集所有节点数据并更新 Bandit，避免 zip 静默截断
-        pending: list[tuple[ProxyNode, dict, float, float]] = []
-        for node_cfg, result in zip_longest(nodes, results):
-            if result is None:
-                logger.warning("节点 %s 无探测结果，跳过", node_cfg.get("name"))
-                continue
-            node = ProxyNode(
-                node_id=result.node_id,
-                server="",
-                port=0,
-                protocol=str(node_cfg.get("type", "unknown")).lower(),
-                country=node_cfg.get("country", ""),
-            )
-            feats = features.build_features(node, [result])
-            score = intelligence.score_node(node, [result])
-            reward = _bandit_reward([result])
-            bandit.update(result.node_id, reward)
-            pending.append((node, feats, score, reward))
-
-        # 全部 update 完再统一计算 UCB 分数 (保证基准一致)
-        rows: list[dict] = []
-        for node, feats, score, reward in pending:
-            rows.append(
-                {
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "node_id": node.node_id,
-                    "protocol_name": node.protocol,
-                    "country_name": node.country,
-                    **feats,
-                    "score": round(score, 4),
-                    "bandit_reward": round(reward, 4),
-                    "bandit_ucb_score": round(bandit.ucb_score(node.node_id), 4),
-                }
-            )
-
-        # 4. 追加到 CSV + 持久化 Bandit 状态
-        _append_csv(out_path, rows, features.feature_names())
-        bandit.save(cfg.bandit.state_path)
-        logger.info(
-            "完成: %d 个节点特征已追加到 %s (Bandit 已更新)", len(rows), out_path
-        )
-
-    asyncio.run(_collect())
+    asyncio.run(run_collect(cfg, output))
 
 
 @cli.command()
 @click.pass_context
 def serve(ctx: click.Context) -> None:
-    """启动 FastAPI 服务。"""
+    """启动 FastAPI 服务 (含 cron 定时 collect)。"""
     import uvicorn
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
 
     from .api import create_app
 
     cfg = ctx.obj["config"]
     app = create_app(cfg)
+
+    def _run_collect_sync() -> None:
+        # BackgroundScheduler 在线程中运行，job 内用 asyncio.run 跑 async 逻辑
+        asyncio.run(run_collect(cfg))
+
+    # 在 serve 进程内按 cron 表达式定时跑 collect (线程调度器，不阻塞主循环)
+    scheduler = BackgroundScheduler()
+    if cfg.collect.schedule:
+        scheduler.add_job(
+            _run_collect_sync,
+            CronTrigger.from_crontab(cfg.collect.schedule),
+        )
+        scheduler.start()
+        logger.info("已调度 collect: cron=%s", cfg.collect.schedule)
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 

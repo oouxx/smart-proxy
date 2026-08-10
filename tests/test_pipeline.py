@@ -18,7 +18,7 @@ def _node(mgr: NodeManager, node_id: str, status: NodeStatus) -> ProxyNode:
 
 
 def test_apply_node_status_transitions():
-    """验证状态机: NEW->PROBING, PROBING 失败->BAD, BAD 成功->ACTIVE。"""
+    """验证状态机: NEW->PROBING, BAD 成功->PROBING (分阶段恢复)。"""
     mgr = NodeManager()
     _node(mgr, "new-1", NodeStatus.NEW)
     _node(mgr, "bad-1", NodeStatus.BAD)
@@ -35,8 +35,27 @@ def test_apply_node_status_transitions():
 
     _apply_node_status(mgr, probe)
 
-    assert mgr.get("new-1").status == NodeStatus.PROBING  # NEW 首次探测后进入 PROBING
-    assert mgr.get("bad-1").status == NodeStatus.ACTIVE   # 最近成功 -> ACTIVE
+    new1 = mgr.get("new-1")
+    bad1 = mgr.get("bad-1")
+    assert new1 is not None and bad1 is not None
+    assert new1.status == NodeStatus.PROBING  # NEW 首次探测后进入 PROBING
+    assert bad1.status == NodeStatus.PROBING  # 分阶段恢复: BAD 成功先进入试探
+
+
+def test_apply_node_status_probing_recovers_to_active():
+    """PROBING 连续成功 3 次后回 ACTIVE (分阶段恢复)。"""
+    mgr = NodeManager()
+    _node(mgr, "rec-1", NodeStatus.PROBING)
+    probe = ProbeEngine.__new__(ProbeEngine)
+    probe._results = {
+        "rec-1": [
+            ProbeResult(node_id="rec-1", success=True) for _ in range(3)
+        ]
+    }
+    _apply_node_status(mgr, probe)
+    rec1 = mgr.get("rec-1")
+    assert rec1 is not None
+    assert rec1.status == NodeStatus.ACTIVE
 
 
 def test_apply_node_status_active_to_bad():
@@ -52,7 +71,9 @@ def test_apply_node_status_active_to_bad():
         ]
     }
     _apply_node_status(mgr, probe)
-    assert mgr.get("act-1").status == NodeStatus.BAD
+    act1 = mgr.get("act-1")
+    assert act1 is not None
+    assert act1.status == NodeStatus.BAD
 
 
 def test_apply_node_status_bad_to_dead():
@@ -66,7 +87,9 @@ def test_apply_node_status_bad_to_dead():
         ]
     }
     _apply_node_status(mgr, probe)
-    assert mgr.get("dead-1").status == NodeStatus.DEAD
+    dead1 = mgr.get("dead-1")
+    assert dead1 is not None
+    assert dead1.status == NodeStatus.DEAD
 
 
 def test_score_node_combines_model_and_realtime():
@@ -129,13 +152,18 @@ async def test_sync_from_mihomo():
     await mgr.sync_from_mihomo(fake)
 
     # 新增的两个节点
-    assert mgr.get("jp-1") is not None
-    assert mgr.get("us-1").protocol == "trojan"
+    jp1 = mgr.get("jp-1")
+    us1 = mgr.get("us-1")
+    assert jp1 is not None
+    assert us1 is not None
+    assert us1.protocol == "trojan"
     # 旧的 stale 节点被移除
     assert mgr.get("stale") is None
 
     # 再次同步: 更新协议 + 移除已消失的节点
     fake2 = _FakeMihomoNodes([{"node_id": "jp-1", "protocol": "hysteria2"}])
     await mgr.sync_from_mihomo(fake2)
-    assert mgr.get("jp-1").protocol == "hysteria2"
+    jp1 = mgr.get("jp-1")
+    assert jp1 is not None
+    assert jp1.protocol == "hysteria2"
     assert mgr.get("us-1") is None

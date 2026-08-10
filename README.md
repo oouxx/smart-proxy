@@ -52,6 +52,12 @@ uv sync --extra dev
 # 运行测试
 uv run pytest
 
+# 类型检查 (pyright)
+uv run pyright
+
+# 代码规范检查 (ruff)
+uv run ruff check src/ tests/
+
 # 编译 Go 探针 (需 Go 1.22+)
 cd go && go build -o ../bin/probe-engine .
 
@@ -126,7 +132,24 @@ uv run mihomo-smart --config config/config.yaml run
 
 ## 定时采集 (collect + cron)
 
-`collect` 命令每小时探测所有节点，提取特征追加到 `data/features.csv`，并更新 Bandit 在线学习状态。用 cron 定时触发：
+`collect` 命令探测所有节点，提取特征追加到 `data/features.csv`，并更新 Bandit 在线学习状态。
+
+### 方式一：serve 内置 cron 调度（推荐）
+
+`serve` 进程内用 APScheduler 按 `collect.schedule`（cron 表达式）定时跑 collect，无需外部 cron：
+
+```bash
+uv run mihomo-smart serve
+```
+
+`config.yaml` 中配置 cron 表达式：
+
+```yaml
+collect:
+  schedule: "0 * * * *"   # 每小时整点跑一次
+```
+
+### 方式二：宿主机 cron
 
 ```cron
 # 每小时整点运行一次
@@ -155,6 +178,39 @@ timestamp,node_id,protocol,country_name,latency_avg_5m,...,score,bandit_reward,b
 - **注入**: 从节点源 (本地/远程) 拉取新节点加入池
 - **淘汰**: 连续失败节点降级 BAD -> DEAD 并移出
 - **修剪**: 定期清理长期低成功率节点，控制池规模
+
+## 智能评分增强
+
+借鉴 Smart Core 原理，评分系统包含以下增强：
+
+- **时间衰减**: 超过 7 天未探测的节点权重逐渐降低 (λ=1/30)
+- **EMA 平滑**: 实时指标用指数移动平均，近期数据权重更高，平滑异常波动
+- **分阶段恢复**: BAD 节点成功先进入 PROBING 试探，连续成功 3 次才回 ACTIVE
+- **智能惩罚**: 连续失败越多惩罚越大 (非线性)，失败越严重降权越明显
+- **交互特征**: 延迟×丢包率、延迟×(1-成功率) 捕捉联合影响
+- **模型自动更新**: collect 可定时自动重训 (默认 72 小时)
+- **数据保留期**: 特征数据超过 14 天自动清理
+
+## Docker 部署
+
+单服务架构：`serve` 进程同时提供 HTTP 下载和 cron 定时 collect。
+
+```bash
+# 1. 准备配置
+cp config.example.yaml config/config.yaml   # 按需修改
+
+# 2. 构建并启动
+docker compose up -d --build
+
+# 3. 查看日志
+docker compose logs -f
+
+# 4. 下载产物
+curl -O http://localhost:8000/download/smart
+curl -O http://localhost:8000/download/model
+```
+
+数据通过挂载卷持久化：`./config`、`./data`、`./models`。
 
 ## 许可证
 

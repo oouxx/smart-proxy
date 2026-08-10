@@ -5,14 +5,14 @@
 #   2. 构建并启动: docker compose up -d --build
 #   3. 查看日志: docker compose logs -f
 #
-# 服务:
-#   - serve:    HTTP 服务 (端口 8000)，提供 mihomo-smart.yaml 和模型下载
-#   - collect:  定时批处理，每小时探测所有节点 -> 特征 CSV -> Bandit 学习
+# 单服务架构:
+#   serve 进程同时提供 HTTP 下载 (端口 8000) 和 cron 定时 collect
+#   (collect 的 cron 表达式在 config.yaml 的 collect.schedule 配置)
 
 services:
   serve:
     build: .
-    container_name: mihomo-smart-serve
+    container_name: mihomo-smart
     ports:
       - "8000:8000"
     volumes:
@@ -20,24 +20,4 @@ services:
       - ./data:/app/data
       - ./models:/app/models
     restart: unless-stopped
-    command: ["uv", "run", "mihomo-smart", "--config", "config/config.yaml", "serve"]
-
-  collect:
-    build: .
-    container_name: mihomo-smart-collect
-    volumes:
-      - ./config:/app/config
-      - ./data:/app/data
-      - ./models:/app/models
-    restart: unless-stopped
-    # 每小时跑一次 collect (探测 -> 特征 -> Bandit 学习)
-    command:
-      - sh
-      - -c
-      - |
-        while true; do
-          echo "[$(date)] 开始 collect"
-          uv run mihomo-smart --config config/config.yaml collect
-          echo "[$(date)] collect 完成，等待 1 小时"
-          sleep 3600
-        done
+    # 默认 CMD 启动 serve (内含 APScheduler 按 collect.schedule 定时跑 collect)

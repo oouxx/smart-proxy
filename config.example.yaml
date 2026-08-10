@@ -32,6 +32,8 @@ model:
   feature_window_min: 30            # 特征时间窗口 (分钟)
   model_weight: 0.7                 # 模型评分权重
   realtime_weight: 0.3              # 实时评分权重
+  auto_train: false                 # collect 是否自动重训模型
+  auto_train_interval_hours: 72     # 自动重训间隔 (小时)
 
 selector:
   top_n: 3                          # 选择 Top N 节点
@@ -61,3 +63,5 @@ pool:
 
 collect:
   output: data/features.csv         # 特征数据 CSV 输出路径 (每小时追加)
+  retention_days: 14                # 特征数据保留期 (天)，超过则清理
+  schedule: "0 * * * *"             # cron 表达式，serve 内定时跑 collect

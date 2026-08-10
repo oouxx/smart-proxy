@@ -23,7 +23,9 @@ async def test_probe_engine_calls_go_probe():
     engine = ProbeEngine(cfg, nodes)
     await engine.start_engine()
     try:
-        result = await engine._probe_node(nodes.get("test-1"))
+        node = nodes.get("test-1")
+        assert node is not None
+        result = await engine._probe_node(node)
         # 本地 TCP 应能建立连接
         assert result.node_id == "test-1"
         assert result.tcp_connect_ms is not None
@@ -45,7 +47,9 @@ async def test_probe_engine_handles_unreachable_node():
     engine = ProbeEngine(cfg, nodes)
     await engine.start_engine()
     try:
-        result = await engine._probe_node(nodes.get("dead-1"))
+        node = nodes.get("dead-1")
+        assert node is not None
+        result = await engine._probe_node(node)
         assert result.node_id == "dead-1"
         assert result.success is False
     finally:
