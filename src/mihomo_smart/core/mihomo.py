@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,6 +18,10 @@ import httpx
 from ..config import MihomoConfig
 
 logger = logging.getLogger(__name__)
+
+# mihomo/clash 中代理组的类型 (这些不是真正的节点)
+_GROUP_TYPES = {"Selector", "URLTest", "Fallback", "LoadBalance", "Relay", "Compatible"}
+_BUILTIN_TYPES = {"Direct", "Reject", "Global"}
 
 
 class MihomoError(RuntimeError):
@@ -29,19 +33,29 @@ class MihomoController:
 
     def __init__(self, cfg: MihomoConfig) -> None:
         self.cfg = cfg
-        self._proc: subprocess.Popen | None = None
+        self._proc: asyncio.subprocess.Process | None = None
         self._base_url = f"http://{cfg.external_controller}"
         self._headers = {"Authorization": f"Bearer {cfg.secret}"} if cfg.secret else {}
 
     async def start(self) -> None:
         """启动 mihomo 子进程。"""
-        if self._proc and self._proc.poll() is None:
+        if self._proc and self._proc.returncode is None:
             return
+        binary = Path(self.cfg.binary)
+        if not binary.exists():
+            raise MihomoError(
+                f"mihomo 内核二进制不存在: {self.cfg.binary}。"
+                "请编译或下载 mihomo 后放入 bin/ 目录。"
+            )
         logger.info("启动 mihomo: %s", self.cfg.binary)
-        self._proc = subprocess.Popen(
-            [self.cfg.binary, "-d", ".", "-f", self.cfg.config_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        self._proc = await asyncio.create_subprocess_exec(
+            self.cfg.binary,
+            "-d",
+            ".",
+            "-f",
+            self.cfg.config_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         # 等待 API 就绪
         for _ in range(50):
@@ -52,10 +66,10 @@ class MihomoController:
 
     async def stop(self) -> None:
         """停止 mihomo 子进程。"""
-        if self._proc and self._proc.poll() is None:
+        if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             try:
-                await asyncio.wait_for(asyncio.to_thread(self._proc.wait), 5)
+                await asyncio.wait_for(self._proc.wait(), 5)
             except asyncio.TimeoutError:
                 self._proc.kill()
         self._proc = None
@@ -75,6 +89,21 @@ class MihomoController:
             r.raise_for_status()
             return r.json()
 
+    async def get_nodes(self) -> list[dict[str, str]]:
+        """从内核获取真正的代理节点列表 (排除代理组与内置项)。
+
+        mihomo 才是节点列表的唯一数据源 (由 proxy-providers 维护)，
+        这里从 API 拉取，Python 侧不再自行维护节点成员。
+        """
+        data = await self.get_proxies()
+        nodes: list[dict[str, str]] = []
+        for name, info in data.get("proxies", {}).items():
+            ptype = info.get("type", "")
+            if ptype in _GROUP_TYPES or ptype in _BUILTIN_TYPES:
+                continue
+            nodes.append({"node_id": name, "protocol": ptype.lower()})
+        return nodes
+
     async def get_proxy(self, name: str) -> dict[str, Any]:
         """获取单个节点信息 (含延迟、历史健康检查)。"""
         async with httpx.AsyncClient(timeout=5.0) as client:
@@ -89,15 +118,5 @@ class MihomoController:
                 f"{self._base_url}/proxies/{group}",
                 headers=self._headers,
                 json={"name": node},
-            )
-            r.raise_for_status()
-
-    async def health_check(self, group: str) -> None:
-        """触发代理组健康检查。"""
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(
-                f"{self._base_url}/group/{group}/delay",
-                headers=self._headers,
-                params={"url": "https://www.gstatic.com/generate_204", "timeout": 5000},
             )
             r.raise_for_status()

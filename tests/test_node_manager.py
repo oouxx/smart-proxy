@@ -1,5 +1,5 @@
 """基础测试。"""
-from subs_check.core.node_manager import NodeManager, NodeStatus, ProxyNode
+from mihomo_smart.core.node_manager import NodeManager, NodeStatus, ProxyNode
 
 
 def test_node_lifecycle():

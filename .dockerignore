@@ -1,0 +1,23 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 运行时产物 (由挂载卷提供)
+data/
+models/
+bin/
+output/
+
+# 敏感配置 (config/ 不入库)
+config/
+
+# 版本控制与系统
+.git/
+.gitignore
+.DS_Store
+*.log

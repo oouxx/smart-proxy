@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "subs-check"
+name = "mihomo-smart"
 version = "0.1.0"
 description = "基于 Mihomo 内核的智能代理节点调度系统 (Python 主控 + Go 嵌入)"
 readme = "README.md"
@@ -31,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-subs-check = "subs_check.cli:main"
+mihomo-smart = "mihomo_smart.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

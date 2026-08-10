@@ -1,0 +1,43 @@
+# mihomo-smart 部署编排
+#
+# 用法:
+#   1. 准备配置: cp config.example.yaml config/config.yaml (按需修改)
+#   2. 构建并启动: docker compose up -d --build
+#   3. 查看日志: docker compose logs -f
+#
+# 服务:
+#   - serve:    HTTP 服务 (端口 8000)，提供 mihomo-smart.yaml 和模型下载
+#   - collect:  定时批处理，每小时探测所有节点 -> 特征 CSV -> Bandit 学习
+
+services:
+  serve:
+    build: .
+    container_name: mihomo-smart-serve
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./models:/app/models
+    restart: unless-stopped
+    command: ["uv", "run", "mihomo-smart", "--config", "config/config.yaml", "serve"]
+
+  collect:
+    build: .
+    container_name: mihomo-smart-collect
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./models:/app/models
+    restart: unless-stopped
+    # 每小时跑一次 collect (探测 -> 特征 -> Bandit 学习)
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          echo "[$(date)] 开始 collect"
+          uv run mihomo-smart --config config/config.yaml collect
+          echo "[$(date)] collect 完成，等待 1 小时"
+          sleep 3600
+        done

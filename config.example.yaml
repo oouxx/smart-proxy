@@ -1,0 +1,63 @@
+# mihomo-smart 配置模板 (示例)
+#
+# 用法:
+#   1. 复制本文件为 config/config.yaml
+#   2. 按需修改 (尤其 node_source 的订阅路径/URL)
+#   3. 本文件不含敏感信息，可安全提交到仓库
+#
+# 注意: config/ 目录整体被 .gitignore 忽略，本文件通过白名单例外保留。
+
+mihomo:
+  binary: bin/mihomo                # mihomo 内核二进制路径
+  config_path: config/mihomo.template.yaml
+  external_controller: 127.0.0.1:9090
+  secret: ""                        # mihomo API 密钥 (可选)
+  log_level: info
+
+probe:
+  interval_sec: 60                   # 活跃节点周期探测间隔 (秒)
+  fast_interval_sec: 10             # 新节点快速探测间隔 (秒)
+  timeout_ms: 5000                  # 单次探测超时 (毫秒)
+  concurrency: 20                   # 并发探测数
+  probe_url: "https://www.gstatic.com/generate_204"
+  download_url: ""                  # 下载测速 URL，留空则跳过测速
+  upload_url: ""                    # 上传测速 URL，留空则跳过测速
+  latency_samples: 5                # 延迟采样次数
+  engine_binary: bin/probe-engine   # Go 探针二进制路径
+  engine_addr: 127.0.0.1:9100       # Go 探针 HTTP 服务地址
+  engine_config: config/mihomo.yaml # 节点订阅文件路径 (mihomo 隧道探测)
+
+model:
+  model_path: models/ranker.lgb     # LightGBM 模型路径
+  feature_window_min: 30            # 特征时间窗口 (分钟)
+  model_weight: 0.7                 # 模型评分权重
+  realtime_weight: 0.3              # 实时评分权重
+
+selector:
+  top_n: 3                          # 选择 Top N 节点
+  min_score: 0.5                    # 最低评分过滤
+  group: GLOBAL                     # mihomo 代理组名
+
+node_source:
+  path: config/mihomo.yaml          # 本地订阅文件 (含节点凭据)
+  url: ""                           # 远程订阅 URL (优先于 path)
+  top_n: 50                         # smart 输出节点数量
+  min_score: 0.0                    # 最低评分过滤
+  output: config/mihomo-smart.yaml  # smart 输出文件
+
+bandit:
+  alpha: 1.0                        # UCB1 探索系数
+  exploration_rate: 0.1             # epsilon-greedy 随机探索概率
+  min_selections: 5                 # 最少选择次数
+  state_path: models/bandit_state.json  # 学习状态持久化
+  reward_window_min: 30             # 计算奖励的历史窗口 (分钟)
+
+pool:
+  max_nodes: 100                    # 节点池上限
+  prune_interval_min: 60            # 修剪节流间隔 (分钟)
+  score_window_min: 30              # 评估成功率的历史窗口 (分钟)
+  min_history: 5                    # 至少多少条历史才评估
+  min_success_rate: 0.3             # 低于此成功率则淘汰
+
+collect:
+  output: data/features.csv         # 特征数据 CSV 输出路径 (每小时追加)

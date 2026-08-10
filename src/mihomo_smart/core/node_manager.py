@@ -67,3 +67,34 @@ class NodeManager:
         node = self._nodes.get(node_id)
         if node:
             node.tags.add(tag)
+
+    async def sync_from_mihomo(self, mihomo) -> None:
+        """从 mihomo 内核同步节点列表。
+
+        mihomo 是节点成员的唯一数据源 (读取订阅/proxy-providers)。
+        这里做增量同步:
+        - 新增: 内核有而本地没有的节点 -> NEW
+        - 更新: 协议类型变化
+        - 删除: 内核已移除的节点
+        """
+        remote = await mihomo.get_nodes()
+        seen: set[str] = set()
+        for info in remote:
+            node_id = info["node_id"]
+            protocol = info.get("protocol", "unknown")
+            seen.add(node_id)
+            existing = self._nodes.get(node_id)
+            if existing is None:
+                # 新增节点: server/port 由内核持有，Python 侧仅用于调度状态
+                self._nodes[node_id] = ProxyNode(
+                    node_id=node_id,
+                    server="",
+                    port=0,
+                    protocol=protocol,
+                )
+            elif existing.protocol != protocol:
+                existing.protocol = protocol
+        # 移除内核中已不存在的节点
+        for node_id in list(self._nodes):
+            if node_id not in seen:
+                self._nodes.pop(node_id, None)

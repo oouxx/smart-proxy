@@ -30,13 +30,24 @@ class SelectorService:
             : self.cfg.top_n
         ]
 
-    async def apply(self, group: str, scores: dict[str, float]) -> list[str]:
-        """选择 Top N 节点并切换 mihomo 当前节点。"""
+    async def apply(
+        self,
+        scores: dict[str, float],
+        group: str | None = None,
+        force: str | None = None,
+    ) -> list[str]:
+        """选择 Top N 节点并切换 mihomo 当前节点。
+
+        group 缺省时使用配置中的 selector.group。
+        force: 强制切换到的节点 (由 Bandit 在线学习决定)，
+               仅在候选 Top 内有效，否则回退到最高分节点。
+        """
+        group = group or self.cfg.group
         top = self.select_top(scores)
         if not top:
             logger.warning("没有满足最低评分的节点")
             return []
-        best = top[0]
+        best = force if force and force in top else top[0]
         logger.info("切换节点 %s -> %s (Top: %s)", group, best, top)
         await self.mihomo.switch_proxy(group, best)
         return top

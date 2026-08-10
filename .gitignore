@@ -1,26 +1,58 @@
-# Python
+# ===== Python =====
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 .venv/
 venv/
+env/
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.pytype/
+.ipynb_checkpoints/
 
-# Go
-go/bin/
-*.exe
-
-# 模型与产物
+# ===== 运行时数据与产物 =====
+# 特征数据累积 (collect 命令每小时追加)
+data/
+# 模型与 Bandit 学习状态 (训练/运行时生成)
 models/
+# 编译产物 (probe-engine, mihomo)
 bin/
 output/
 
-# 环境
+# ===== 测试临时文件 =====
+# 100 节点测试产生的临时配置/数据
+config-test*.yaml
+config/mihomo-test*.yaml
+config/mihomo-smart*.yaml
+data/features_test*.csv
+models/bandit_state_test*.json
+
+# ===== Go =====
+go/bin/
+*.exe
+*.test
+*.out
+
+# ===== 系统与 IDE =====
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ===== 环境与日志 =====
 .env
+.env.*
+*.log
+logs/
 
-# 文档
-docs
-
-# config
-config/mihomo.yaml
+# ===== 敏感配置 =====
+# 整个 config 目录不入库 (含节点订阅凭据、smart 输出等)
+config/
+# 但保留不含敏感信息的配置模板
+!config.example.yaml

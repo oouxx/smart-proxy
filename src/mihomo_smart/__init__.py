@@ -1,4 +1,4 @@
-"""subs-check: 基于 Mihomo 内核的智能代理节点调度系统。
+"""mihomo-smart: 基于 Mihomo 内核的智能代理节点调度系统。
 
 架构:
 - Python 主控: 编排、特征工程、机器学习、实时评分、选择器、API 服务
