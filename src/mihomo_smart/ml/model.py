@@ -41,7 +41,11 @@ class NodeRanker:
             logger.warning("模型不存在: %s，将使用实时评分", path)
 
     def predict(self, feature_dicts: list[dict[str, float]]) -> list[float]:
-        """预测节点质量分数 (0~1)。"""
+        """预测节点质量分数 (0~1)。
+
+        对模型缺失/特征不匹配等异常做防御: 记录警告并回落 0.5，
+        避免已训练模型与当前特征集不一致时崩溃探针循环 (仅用实时评分兜底)。
+        """
         if self._model is None:
             return [0.5] * len(feature_dicts)
         X = pd.DataFrame(
@@ -51,7 +55,11 @@ class NodeRanker:
             ],
             columns=self.features.feature_names(),
         )
-        scores = np.asarray(self._model.predict(X))
+        try:
+            scores = np.asarray(self._model.predict(X))
+        except Exception as exc:  # noqa: BLE001 - 特征不匹配等预测异常
+            logger.warning("模型预测失败，回退实时评分: %s", exc)
+            return [0.5] * len(feature_dicts)
         return [float(np.clip(s, 0.0, 1.0)) for s in scores]
 
     def train(
@@ -126,7 +134,11 @@ class RealtimeScorer:
         failure_count: int,
         consecutive_failures: int = 0,
     ) -> float:
-        """实时评分 (0~1)。"""
+        """实时评分 (0~1)。
+
+        权重和 = 1.0: 延迟 0.4 + 速度 0.3 + 成功率 0.3，与 quality_label
+        的权重分配保持一致，使完美节点可达 1.0。
+        """
         score = 0.0
         if latency_ms is not None:
             # 延迟越低越好，200ms 以下满分
@@ -134,7 +146,7 @@ class RealtimeScorer:
         if speed_kbps is not None:
             # 速度越高越好，10Mbps 以上满分
             score += 0.3 * min(1.0, speed_kbps / 10_000.0)
-        score += 0.2 * success_rate
+        score += 0.3 * success_rate
         # 智能惩罚: 连续失败越多惩罚越大 (非线性)，失败越严重降权越明显
         penalty = 0.15 * (1.0 - math.exp(-consecutive_failures / 2.0))
         score -= penalty
@@ -164,7 +176,9 @@ class IntelligenceEngine:
         - EMA 平滑: 实时指标用指数移动平均，近期数据权重更高
         - 智能惩罚: 连续失败越多，实时分惩罚越大 (非线性)
         - 时间衰减: 长时间未探测的节点降权
+        - 时间窗口: 仅使用最近 feature_window_min 分钟内的探测记录
         """
+        history = self._windowed(history)
         feats = self.ranker.features.build_features(node, history)
         model_score = self.ranker.predict([feats])[0]
 
@@ -194,6 +208,14 @@ class IntelligenceEngine:
         score = self.final_score(model_score, realtime_score)
         # 时间衰减: 长时间未探测的节点降权
         return score * self._time_decay(history)
+
+    def _windowed(self, history: list[ProbeResult]) -> list[ProbeResult]:
+        """按 feature_window_min 过滤历史记录；窗口 <=0 表示不限窗口。"""
+        window = self.cfg.feature_window_min * 60
+        if window <= 0:
+            return history
+        cutoff = time.time() - window
+        return [r for r in history if r.timestamp >= cutoff]
 
     @staticmethod
     def _ema(values: list[float], alpha: float = 0.5) -> float:

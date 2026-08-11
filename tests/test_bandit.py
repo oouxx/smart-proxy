@@ -30,6 +30,20 @@ def test_ucb_prefers_high_value_arm():
     assert chosen[0] == "a"
 
 
+def test_min_selections_prioritizes_under_selected():
+    """选择次数不足 min_selections 的臂应优先被探索，即便其奖励较高臂更低。"""
+    b = BanditLearner(min_selections=5, exploration_rate=0.0, seed=42)
+    # b 只被选过 1 次 (未充分探索)，a 被选 10 次 (充分探索、高奖励)
+    b.update("a", 0.9)
+    for _ in range(9):
+        b.update("a", 0.9)
+    b.update("b", 0.1)
+    assert b._counts["a"] >= b.min_selections
+    assert b._counts["b"] < b.min_selections
+    chosen = b.select(["a", "b"], top_k=1)
+    assert chosen[0] == "b"
+
+
 def test_update_incremental_mean():
     """update 应维护增量均值。"""
     b = BanditLearner()

@@ -160,20 +160,36 @@ class ProbeEngine:
             if on_round is not None:
                 await on_round()
             # 用事件等待替代固定 sleep，stop() 可立即中断
+            # 有 NEW/PROBING 节点在探测时用快速间隔，否则用常规间隔
+            interval = self._wait_interval()
             try:
                 await asyncio.wait_for(
-                    self._stop_event.wait(), timeout=self.cfg.interval_sec
+                    self._stop_event.wait(), timeout=interval
                 )
             except asyncio.TimeoutError:
                 pass
+
+    def _wait_interval(self) -> int:
+        """存在待探测/探测中的新节点时返回快速间隔，否则返回常规间隔。"""
+        if self.nodes.list(NodeStatus.NEW) or self.nodes.list(NodeStatus.PROBING):
+            return self.cfg.fast_interval_sec
+        return self.cfg.interval_sec
 
     async def stop(self) -> None:
         self._running = False
         self._stop_event.set()
 
     async def probe_once(self) -> None:
-        """对候选节点执行一轮探测 (通过 Go 探针隧道)。"""
-        targets = self.nodes.list(NodeStatus.ACTIVE) + self.nodes.list(NodeStatus.PROBING)
+        """对候选节点执行一轮探测 (通过 Go 探针隧道)。
+
+        覆盖 NEW/PROBING/ACTIVE: NEW 首次被探测后由状态机转为 PROBING，
+        BAD/DEAD 是降级/淘汰节点，不参与常规探测。
+        """
+        targets = (
+            self.nodes.list(NodeStatus.NEW)
+            + self.nodes.list(NodeStatus.PROBING)
+            + self.nodes.list(NodeStatus.ACTIVE)
+        )
         if not targets:
             return
         sem = asyncio.Semaphore(self.cfg.concurrency)
@@ -225,8 +241,18 @@ class ProbeEngine:
         }
         # 批量探测耗时 = 节点数/并发 × 单节点超时，加 2 倍余量 + 60s 缓冲
         # (每批含下载测速约 3s 等开销，余量不足会导致 HTTP 超时)
+        # httpx 0.28 的 Timeout 无 total 字段；read 超时会在等待服务器响应
+        # (含批量计算) 期间持续生效，因此把 read 设为批量估算上限作为整体
+        # 等待的近似截止，connect/write/pool 用单节点量级即可 (localhost)。
         batches = max(1, len(nodes) / max(self.cfg.concurrency, 1))
-        timeout = self.cfg.timeout_ms / 1000 * batches * 2 + 60
+        total = self.cfg.timeout_ms / 1000 * batches * 2 + 60
+        base = self.cfg.timeout_ms / 1000 + 5
+        timeout = httpx.Timeout(
+            connect=base,
+            read=total,
+            write=base,
+            pool=base,
+        )
         try:
             async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
                 r = await client.post(f"{self._base_url}/probe_all", json=payload)

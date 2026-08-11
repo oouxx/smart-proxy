@@ -64,15 +64,19 @@ class BanditLearner:
     def select(self, arm_ids: list[str], top_k: int = 1) -> list[str]:
         """从候选臂中选择 Top K。
 
-        未探索的臂优先 (全部给 inf，随机取)。
-        否则以 exploration_rate 概率做 epsilon-greedy 随机探索，
+        优先选择未探索或选择次数不足 min_selections 的臂 (鼓励探索阶段)，
+        全部充分探索后以 exploration_rate 概率做 epsilon-greedy 随机探索，
         其余按 UCB1 分数选择。
         """
         if not arm_ids:
             return []
-        unexplored = [a for a in arm_ids if self._counts.get(a, 0) == 0]
-        if unexplored:
-            return unexplored[:top_k]
+        # 未探索或采样不足 min_selections 的臂优先 (鼓励探索)
+        under_selected = [
+            a for a in arm_ids if self._counts.get(a, 0) < self.min_selections
+        ]
+        if under_selected:
+            self._rng.shuffle(under_selected)
+            return under_selected[:top_k]
 
         if self._rng.random() < self.exploration_rate:
             # 随机探索

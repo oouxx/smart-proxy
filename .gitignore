@@ -33,6 +33,7 @@ models/bandit_state_test*.json
 
 # ===== Go =====
 go/bin/
+go/go
 *.exe
 *.test
 *.out

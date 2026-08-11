@@ -15,19 +15,17 @@ from .core.node_manager import NodeStatus
 logger = logging.getLogger(__name__)
 
 
-# 连续失败多少次判定为坏节点 (降级到 BAD)
-_BAD_AFTER_FAILURES = 3
-# 连续失败多少次判定为死节点 (降级到 DEAD，随后被动态池淘汰)
-_DEAD_AFTER_FAILURES = 10
-# 分阶段恢复: BAD 节点成功后再连续成功多少次才回 ACTIVE
-_RECOVERY_SUCCESSES = 3
-
-
-def _bandit_reward(history: list) -> float:
+def _bandit_reward(history: list, window_min: int = 0) -> float:
     """根据探测历史计算 Bandit 奖励 (0~1)。
 
     奖励 = 成功率 + 延迟/速度加权，作为在线学习的真实反馈。
+    window_min > 0 时仅使用最近 window_min 分钟内的探测记录。
     """
+    if not history:
+        return 0.0
+    if window_min > 0:
+        cutoff = time.time() - window_min * 60
+        history = [r for r in history if r.timestamp >= cutoff]
     if not history:
         return 0.0
     success_rate = sum(1 for r in history if r.success) / len(history)
@@ -44,11 +42,18 @@ def _bandit_reward(history: list) -> float:
     return max(0.0, min(1.0, 0.5 * success_rate + 0.3 * latency_score + 0.2 * speed_score))
 
 
-def _apply_node_status(nodes, probe) -> None:
+def _apply_node_status(
+    nodes,
+    probe,
+    bad_after: int = 3,
+    dead_after: int = 10,
+    recovery_successes: int = 3,
+) -> None:
     """根据最近探测结果驱动节点状态机迁移。
 
     NEW -> PROBING (首次探测) -> ACTIVE (首次成功)
     ACTIVE/BAD -> BAD (连续多次失败)
+    阈值由 ProbeConfig 提供，快速更替场景可调小淘汰参数。
     """
     for node in nodes.list():
         history = probe.history(node.node_id)
@@ -63,24 +68,24 @@ def _apply_node_status(nodes, probe) -> None:
                     # 分阶段恢复: BAD 成功先进入 PROBING 试探
                     nodes.set_status(node.node_id, NodeStatus.PROBING)
                 else:
-                    # PROBING 连续成功 _RECOVERY_SUCCESSES 次后回 ACTIVE
-                    recent = history[-_RECOVERY_SUCCESSES:]
-                    if len(recent) >= _RECOVERY_SUCCESSES and all(
+                    # PROBING 连续成功 recovery_successes 次后回 ACTIVE
+                    recent = history[-recovery_successes:]
+                    if len(recent) >= recovery_successes and all(
                         r.success for r in recent
                     ):
                         nodes.set_status(node.node_id, NodeStatus.ACTIVE)
-            elif len(history) >= _DEAD_AFTER_FAILURES and all(
-                not r.success for r in history[-_DEAD_AFTER_FAILURES:]
+            elif len(history) >= dead_after and all(
+                not r.success for r in history[-dead_after:]
             ):
                 # 连续失败过多 -> DEAD，由动态池淘汰
                 nodes.set_status(node.node_id, NodeStatus.DEAD)
-            elif len(history) >= _BAD_AFTER_FAILURES and all(
-                not r.success for r in history[-_BAD_AFTER_FAILURES:]
+            elif len(history) >= bad_after and all(
+                not r.success for r in history[-bad_after:]
             ):
                 nodes.set_status(node.node_id, NodeStatus.BAD)
         elif node.status == NodeStatus.ACTIVE and not latest.success and (
-            len(history) >= _BAD_AFTER_FAILURES
-            and all(not r.success for r in history[-_BAD_AFTER_FAILURES:])
+            len(history) >= bad_after
+            and all(not r.success for r in history[-bad_after:])
         ):
             nodes.set_status(node.node_id, NodeStatus.BAD)
 
@@ -132,12 +137,16 @@ def smart(ctx: click.Context) -> None:
         intelligence = IntelligenceEngine(cfg.model, ranker, scorer)
 
         scored: list[tuple[float, dict]] = []
-        for node_cfg, result in zip(nodes, results):
+        for node_cfg, result in zip_longest(nodes, results):
+            if result is None:
+                logger.warning("节点 %s 无探测结果，跳过", node_cfg.get("name"))
+                continue
             node = ProxyNode(
                 node_id=result.node_id,
                 server="",
                 port=0,
                 protocol=str(node_cfg.get("type", "unknown")).lower(),
+                country=node_cfg.get("country", ""),
             )
             score = intelligence.score_node(node, [result])
             scored.append((score, node_cfg))
@@ -194,6 +203,7 @@ def train(ctx: click.Context) -> None:
                 server="",
                 port=0,
                 protocol=str(node_cfg.get("type", "unknown")).lower(),
+                country=node_cfg.get("country", ""),
             )
             feats = features.build_features(node, [result])
             X.append([feats[name] for name in features.feature_names()])
@@ -364,7 +374,7 @@ async def run_collect(cfg, out_path: str | None = None) -> None:
         )
         feats = features.build_features(node, [result])
         score = intelligence.score_node(node, [result])
-        reward = _bandit_reward([result])
+        reward = _bandit_reward([result], cfg.bandit.reward_window_min)
         bandit.update(result.node_id, reward)
         pending.append((node, feats, score, reward))
         # 收集训练样本 (用于模型自动更新)
@@ -396,11 +406,15 @@ async def run_collect(cfg, out_path: str | None = None) -> None:
     if cfg.model.auto_train and _should_retrain(
         cfg.model.model_path, cfg.model.auto_train_interval_hours
     ):
-        if len(X_train) >= 10:
+        if len(X_train) >= cfg.model.min_train_samples:
             ranker.train(X_train, y_train, feature_names=features.feature_names())
             logger.info("模型自动重训完成 (%d 个样本)", len(X_train))
         else:
-            logger.info("样本不足 (%d)，跳过自动重训", len(X_train))
+            logger.info(
+                "样本不足 (%d/%d)，跳过自动重训",
+                len(X_train),
+                cfg.model.min_train_samples,
+            )
 
     logger.info("完成: %d 个节点特征已追加到 %s (Bandit 已更新)", len(rows), out_path)
 
@@ -420,15 +434,22 @@ def collect(ctx: click.Context, output: str | None) -> None:
 @cli.command()
 @click.pass_context
 def serve(ctx: click.Context) -> None:
-    """启动 FastAPI 服务 (含 cron 定时 collect)。"""
+    """启动 FastAPI 服务: 探针循环 + 节点状态机 + 实时评分 + cron 定时 collect。"""
+    import asyncio
+
     import uvicorn
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
 
     from .api import create_app
+    from .core.node_manager import NodeManager, ProxyNode
+    from .core.node_source import load_nodes
+    from .core.probe import ProbeEngine
+    from .ml.bandit import BanditLearner
+    from .ml.features import FeatureEngine
+    from .ml.model import IntelligenceEngine, NodeRanker, RealtimeScorer
 
     cfg = ctx.obj["config"]
-    app = create_app(cfg)
 
     def _run_collect_sync() -> None:
         # BackgroundScheduler 在线程中运行，job 内用 asyncio.run 跑 async 逻辑
@@ -444,7 +465,131 @@ def serve(ctx: click.Context) -> None:
         scheduler.start()
         logger.info("已调度 collect: cron=%s", cfg.collect.schedule)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 加载节点池，供探针循环 + 状态机 + API 展示
+    mgr = NodeManager()
+
+    def _pool_add(manager: NodeManager, n: dict) -> None:
+        node_id = str(n.get("name", ""))
+        if not node_id or manager.get(node_id):
+            return
+        manager.add(
+            ProxyNode(
+                node_id=node_id,
+                server="",
+                port=0,
+                protocol=str(n.get("type", "unknown")).lower(),
+                country=n.get("country", ""),
+            )
+        )
+
+    for n in load_nodes(cfg.node_source):
+        _pool_add(mgr, n)
+
+    features = FeatureEngine()
+    ranker = NodeRanker(cfg.model, features)
+    ranker.load()
+    scorer = RealtimeScorer()
+    intelligence = IntelligenceEngine(cfg.model, ranker, scorer)
+    bandit = BanditLearner(
+        alpha=cfg.bandit.alpha,
+        exploration_rate=cfg.bandit.exploration_rate,
+        min_selections=cfg.bandit.min_selections,
+    )
+    bandit.load(cfg.bandit.state_path)
+    engine = ProbeEngine(cfg.probe, mgr)
+    scores: dict[str, float] = {}
+
+    app = create_app(cfg, node_manager=mgr, scores=scores)
+
+    def _sync_nodes() -> None:
+        """节点源同步: 加入新节点，淘汰不在订阅且已降级/死亡的节点，清理 Bandit。
+
+        快速更替场景订阅文件频繁变化，需周期性刷新节点池，避免新节点永远
+        不被探测、淘汰节点的 Bandit 臂无限堆积。
+        """
+        fresh = load_nodes(cfg.node_source)
+        fresh_ids = {str(n.get("name", "")) for n in fresh if n.get("name")}
+        # 1. 新增节点 (加入后由探针循环按 NEW -> PROBING 快速探测)
+        for n in fresh:
+            _pool_add(mgr, n)
+        # 2. 淘汰: 已不在订阅 且 已降级/死亡的节点 (移除并清理 bandit 臂)
+        removed = False
+        for node in mgr.list():
+            if node.node_id in fresh_ids:
+                continue
+            if node.status in (NodeStatus.BAD, NodeStatus.DEAD):
+                mgr.remove(node.node_id)
+                bandit.forget(node.node_id)
+                scores.pop(node.node_id, None)
+                removed = True
+                logger.info(
+                    "节点 %s 已淘汰 (不在订阅且状态=%s)",
+                    node.node_id,
+                    node.status.value,
+                )
+        if removed:
+            bandit.save(cfg.bandit.state_path)
+
+    async def _probe_loop() -> None:
+        """周期探测 + 节点状态机迁移 + 实时评分 + Bandit 在线学习。
+
+        与 uvicorn 共享同一事件循环；异常时记录日志而非让服务崩溃。
+        """
+        try:
+            await engine.start_engine()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("探针引擎启动失败，仅提供 API/collect 服务: %s", exc)
+            return
+        try:
+            async def on_round() -> None:
+                _apply_node_status(
+                    mgr,
+                    engine,
+                    bad_after=cfg.probe.bad_after_failures,
+                    dead_after=cfg.probe.dead_after_failures,
+                    recovery_successes=cfg.probe.recovery_successes,
+                )
+                for node in mgr.list():
+                    history = engine.history(node.node_id)
+                    if history:
+                        bandit.update(
+                            node.node_id,
+                            _bandit_reward(history, cfg.bandit.reward_window_min),
+                        )
+                    scores[node.node_id] = round(
+                        intelligence.score_node(node, history), 4
+                    )
+                bandit.save(cfg.bandit.state_path)
+
+            await engine.run(on_round=on_round)
+        finally:
+            await engine.stop_engine()
+
+    async def _sync_loop() -> None:
+        """周期性刷新节点源 (独立任务，不阻塞探针循环)。"""
+        while True:
+            await asyncio.sleep(cfg.node_source.refresh_interval_sec)
+            try:
+                await asyncio.to_thread(_sync_nodes)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("节点源同步失败: %s", exc)
+
+    async def _run_serve() -> None:
+        loop = asyncio.get_running_loop()
+        tasks = [
+            loop.create_task(_probe_loop()),
+            loop.create_task(_sync_loop()),
+        ]
+        try:
+            await uvicorn.Server(
+                uvicorn.Config(app, host="0.0.0.0", port=8000)
+            ).serve()
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(_run_serve())
 
 
 def main() -> None:

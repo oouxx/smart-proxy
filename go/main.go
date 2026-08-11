@@ -18,7 +18,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -135,19 +134,15 @@ func resolveProbeParams(req ProbeRequest) (time.Duration, int, string) {
 
 // probe 对单个节点执行完整探测。
 func probe(req ProbeRequest) ProbeResult {
-	// 优先走 mihomo 隧道探测 (节点在订阅文件中)
-	if cfg, ok := loadedProxies[req.NodeID]; ok {
-		return probeWithConfig(cfg, req)
+	// 节点必须在订阅文件中才能走 mihomo 隧道探测。
+	// 不再提供直连 fallback: 直连测量的是本机到目标的指标，与节点质量无关，
+	// 会误导评分排序，因此节点不在订阅文件中时直接视为探测失败。
+	cfg, ok := loadedProxies[req.NodeID]
+	if !ok {
+		log.Printf("节点 %s 不在订阅文件中，无法探测", req.NodeID)
+		return ProbeResult{NodeID: req.NodeID, Timestamp: time.Now().Unix()}
 	}
-
-	// fallback: 直连探测 server:port
-	result := ProbeResult{
-		NodeID:    req.NodeID,
-		Timestamp: time.Now().Unix(),
-	}
-	timeout, samples, probeURL := resolveProbeParams(req)
-	probeDirect(req, &result, timeout, samples, probeURL)
-	return result
+	return probeWithConfig(cfg, req)
 }
 
 // probeWithConfig 对给定节点配置执行 mihomo 隧道探测。
@@ -268,69 +263,6 @@ func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, t
 	// 4. 上传速度 (经隧道)
 	if req.UploadURL != "" {
 		if speed := measureUpload(client, req.UploadURL, timeout); speed != nil {
-			result.UploadSpeedKbps = speed
-		}
-	}
-
-	result.Success = true
-}
-
-// probeDirect 对 server:port 直连测量 (fallback 后端)。
-func probeDirect(req ProbeRequest, result *ProbeResult, timeout time.Duration, samples int, probeURL string) {
-	addr := net.JoinHostPort(req.Server, fmt.Sprintf("%d", req.Port))
-
-	// 1. TCP 连接耗时
-	tcpStart := time.Now()
-	conn, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		return // success=false
-	}
-	tcpMS := float64(time.Since(tcpStart).Microseconds()) / 1000.0
-	result.TCPConnectMS = &tcpMS
-
-	// 2. TLS 握手耗时 (如果启用)
-	if req.TLS {
-		tlsStart := time.Now()
-		tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
-		if err := tlsConn.Handshake(); err != nil {
-			conn.Close()
-			return
-		}
-		tlsMS := float64(time.Since(tlsStart).Microseconds()) / 1000.0
-		result.TLSHandshakeMS = &tlsMS
-		conn = tlsConn
-	}
-	conn.Close()
-
-	// 3. 延迟 + 抖动 + 丢包 (多次 HTTP 请求)
-	latencies := measureLatency(http.DefaultClient, probeURL, samples)
-	if len(latencies) == 0 {
-		return // success=false
-	}
-	stats := computeLatencyStats(latencies, samples)
-	result.LatencyMS = ptrFloat(stats.avg)
-	result.LatencyMinMS = ptrFloat(stats.min)
-	result.LatencyMaxMS = ptrFloat(stats.max)
-	result.LatencyP50MS = ptrFloat(stats.p50)
-	result.LatencyP95MS = ptrFloat(stats.p95)
-	result.PacketLoss = ptrFloat(stats.loss)
-	result.JitterMS = ptrFloat(stats.jitter)
-	result.SuccessRate = ptrFloat(stats.successRate)
-
-	// 4. 下载速度 + 首字节时间
-	if req.DownloadURL != "" {
-		speed, firstByte := measureDownload(http.DefaultClient, req.DownloadURL, timeout)
-		if speed != nil {
-			result.DownloadSpeedKbps = speed
-		}
-		if firstByte != nil {
-			result.FirstByteMS = firstByte
-		}
-	}
-
-	// 5. 上传速度
-	if req.UploadURL != "" {
-		if speed := measureUpload(http.DefaultClient, req.UploadURL, timeout); speed != nil {
 			result.UploadSpeedKbps = speed
 		}
 	}

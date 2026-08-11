@@ -19,14 +19,19 @@ probe:
   engine_binary: bin/probe-engine   # Go 探针二进制路径
   engine_addr: 127.0.0.1:9100       # Go 探针 HTTP 服务地址
   engine_config: config/mihomo.yaml # 节点订阅文件路径 (mihomo 隧道探测)
+  # 节点健康状态机阈值 (快速更替场景可调小淘汰参数)
+  bad_after_failures: 3             # 连续失败多少次降为 BAD
+  dead_after_failures: 10           # 连续失败多少次降为 DEAD (可被淘汰)
+  recovery_successes: 3             # 分阶段恢复: 连续成功多少次回 ACTIVE
 
 model:
   model_path: models/ranker.lgb     # LightGBM 模型路径
   feature_window_min: 30            # 特征时间窗口 (分钟)
-  model_weight: 0.7                 # 模型评分权重
-  realtime_weight: 0.3              # 实时评分权重
+  model_weight: 0.7                 # 模型评分权重 (快速更替下调小, 更依赖实时分)
+  realtime_weight: 0.3              # 实时评分权重 (快速更替下调大)
   auto_train: false                 # collect 是否自动重训模型
   auto_train_interval_hours: 72     # 自动重训间隔 (小时)
+  min_train_samples: 10             # 自动重训最低样本数 (快速更替下调高, 避免噪声)
 
 node_source:
   path: config/mihomo.yaml          # 本地订阅文件 (含节点凭据)
@@ -34,6 +39,7 @@ node_source:
   top_n: 50                         # smart 输出节点数量
   min_score: 0.0                    # 最低评分过滤
   output: config/mihomo-smart.yaml  # smart 输出文件
+  refresh_interval_sec: 300         # serve 节点源同步间隔 (快速更替下调小)
 
 bandit:
   alpha: 1.0                        # UCB1 探索系数

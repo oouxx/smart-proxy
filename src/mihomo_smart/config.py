@@ -1,10 +1,13 @@
 """配置管理: 加载 YAML 配置并校验。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any, TypeVar, cast
 
 import yaml
+
+T = TypeVar("T")
 
 
 @dataclass
@@ -22,6 +25,10 @@ class ProbeConfig:
     engine_binary: str = "bin/probe-engine"  # Go 探针二进制路径
     engine_addr: str = "127.0.0.1:9100"     # Go 探针 HTTP 服务地址
     engine_config: str = "config/mihomo.yaml"  # 节点订阅文件路径 (mihomo 隧道探测)
+    # 节点健康状态机阈值 (快速更替场景可调小)
+    bad_after_failures: int = 3          # 连续失败多少次降为 BAD
+    dead_after_failures: int = 10        # 连续失败多少次降为 DEAD (可被淘汰)
+    recovery_successes: int = 3          # 分阶段恢复: 连续成功多少次回 ACTIVE
 
 
 @dataclass
@@ -34,6 +41,7 @@ class ModelConfig:
     realtime_weight: float = 0.3    # 实时评分权重
     auto_train: bool = False        # collect 是否自动重训模型
     auto_train_interval_hours: int = 72  # 自动重训间隔 (小时)
+    min_train_samples: int = 10     # 自动重训最低样本数 (快速更替下应调高，避免噪声)
 
 
 @dataclass
@@ -65,6 +73,7 @@ class NodeSourceConfig:
     top_n: int = 50                     # 输出节点数量
     min_score: float = 0.0              # 最低评分过滤
     output: str = "config/mihomo-smart.yaml"  # 输出文件
+    refresh_interval_sec: int = 300     # serve 节点源同步间隔 (快速更替下调小)
 
 
 @dataclass
@@ -77,6 +86,12 @@ class Config:
     bandit: BanditConfig = field(default_factory=BanditConfig)
     collect: CollectConfig = field(default_factory=CollectConfig)
 
+    @staticmethod
+    def _sub(raw: dict, cls: type[T]) -> T:
+        """从 dict 构造子配置，过滤掉非 dataclass 字段 (容忍拼错/多余 key)。"""
+        valid = {f.name for f in fields(cast(Any, cls))}
+        return cast(T, cls(**{k: v for k, v in raw.items() if k in valid}))
+
     @classmethod
     def load(cls, path: str | Path) -> Config:
         """从 YAML 文件加载配置。"""
@@ -85,9 +100,9 @@ class Config:
             return cls()
         raw = yaml.safe_load(path.read_text()) or {}
         return cls(
-            probe=ProbeConfig(**raw.get("probe", {})),
-            model=ModelConfig(**raw.get("model", {})),
-            node_source=NodeSourceConfig(**raw.get("node_source", {})),
-            bandit=BanditConfig(**raw.get("bandit", {})),
-            collect=CollectConfig(**raw.get("collect", {})),
+            probe=cls._sub(raw.get("probe", {}), ProbeConfig),
+            model=cls._sub(raw.get("model", {}), ModelConfig),
+            node_source=cls._sub(raw.get("node_source", {}), NodeSourceConfig),
+            bandit=cls._sub(raw.get("bandit", {}), BanditConfig),
+            collect=cls._sub(raw.get("collect", {}), CollectConfig),
         )
