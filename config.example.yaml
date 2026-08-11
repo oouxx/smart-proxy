@@ -7,13 +7,6 @@
 #
 # 注意: config/ 目录整体被 .gitignore 忽略，本文件通过白名单例外保留。
 
-mihomo:
-  binary: bin/mihomo                # mihomo 内核二进制路径
-  config_path: config/mihomo.template.yaml
-  external_controller: 127.0.0.1:9090
-  secret: ""                        # mihomo API 密钥 (可选)
-  log_level: info
-
 probe:
   interval_sec: 60                   # 活跃节点周期探测间隔 (秒)
   fast_interval_sec: 10             # 新节点快速探测间隔 (秒)
@@ -35,11 +28,6 @@ model:
   auto_train: false                 # collect 是否自动重训模型
   auto_train_interval_hours: 72     # 自动重训间隔 (小时)
 
-selector:
-  top_n: 3                          # 选择 Top N 节点
-  min_score: 0.5                    # 最低评分过滤
-  group: GLOBAL                     # mihomo 代理组名
-
 node_source:
   path: config/mihomo.yaml          # 本地订阅文件 (含节点凭据)
   url: ""                           # 远程订阅 URL (优先于 path)
@@ -53,13 +41,6 @@ bandit:
   min_selections: 5                 # 最少选择次数
   state_path: models/bandit_state.json  # 学习状态持久化
   reward_window_min: 30             # 计算奖励的历史窗口 (分钟)
-
-pool:
-  max_nodes: 100                    # 节点池上限
-  prune_interval_min: 60            # 修剪节流间隔 (分钟)
-  score_window_min: 30              # 评估成功率的历史窗口 (分钟)
-  min_history: 5                    # 至少多少条历史才评估
-  min_success_rate: 0.3             # 低于此成功率则淘汰
 
 collect:
   output: data/features.csv         # 特征数据 CSV 输出路径 (每小时追加)

@@ -1,10 +1,8 @@
-"""核心链路测试: 状态机迁移 + 评分融合 + 选择器。"""
+"""核心链路测试: 状态机迁移 + 评分融合。"""
 from __future__ import annotations
 
-import pytest
-
 from mihomo_smart.cli import _apply_node_status
-from mihomo_smart.config import ModelConfig, SelectorConfig
+from mihomo_smart.config import ModelConfig
 from mihomo_smart.core.node_manager import NodeManager, NodeStatus, ProxyNode
 from mihomo_smart.core.probe import ProbeEngine, ProbeResult
 from mihomo_smart.ml.features import FeatureEngine
@@ -110,60 +108,3 @@ def test_score_node_combines_model_and_realtime():
     assert 0.0 <= score <= 1.0
     # 实时分(延迟低+成功率100%)应 > 0
     assert score > 0.0
-
-
-def test_selector_top_n_filter():
-    """选择器应按评分取 Top N 并过滤低于 min_score 的节点。"""
-    cfg = SelectorConfig(top_n=2, min_score=0.5, group="GLOBAL")
-    from mihomo_smart.core.mihomo import MihomoController
-    from mihomo_smart.core.selector import SelectorService
-
-    nodes = NodeManager()
-    selector = SelectorService(cfg, nodes, MihomoController.__new__(MihomoController))
-
-    scores = {"a": 0.9, "b": 0.7, "c": 0.2, "d": 0.6}
-    top = selector.select_top(scores)
-    assert top == ["a", "b"]  # 0.9, 0.7 达标且 top_n=2; c 不达标
-
-
-class _FakeMihomoNodes:
-    """伪造 mihomo，模拟 get_nodes 返回的节点列表。"""
-
-    def __init__(self, nodes: list[dict]) -> None:
-        self._nodes = nodes
-
-    async def get_nodes(self):
-        return self._nodes
-
-
-@pytest.mark.asyncio
-async def test_sync_from_mihomo():
-    """NodeManager 应从 mihomo 内核同步节点成员: 新增/更新/删除。"""
-    mgr = NodeManager()
-    # 本地有一个内核中不存在的旧节点
-    mgr.add(ProxyNode(node_id="stale", server="", port=0, protocol="vmess"))
-
-    fake = _FakeMihomoNodes(
-        [
-            {"node_id": "jp-1", "protocol": "vmess"},
-            {"node_id": "us-1", "protocol": "trojan"},
-        ]
-    )
-    await mgr.sync_from_mihomo(fake)
-
-    # 新增的两个节点
-    jp1 = mgr.get("jp-1")
-    us1 = mgr.get("us-1")
-    assert jp1 is not None
-    assert us1 is not None
-    assert us1.protocol == "trojan"
-    # 旧的 stale 节点被移除
-    assert mgr.get("stale") is None
-
-    # 再次同步: 更新协议 + 移除已消失的节点
-    fake2 = _FakeMihomoNodes([{"node_id": "jp-1", "protocol": "hysteria2"}])
-    await mgr.sync_from_mihomo(fake2)
-    jp1 = mgr.get("jp-1")
-    assert jp1 is not None
-    assert jp1.protocol == "hysteria2"
-    assert mgr.get("us-1") is None

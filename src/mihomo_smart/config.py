@@ -8,17 +8,6 @@ import yaml
 
 
 @dataclass
-class MihomoConfig:
-    """mihomo 内核配置。"""
-
-    binary: str = "bin/mihomo"
-    config_path: str = "config/mihomo.yaml"
-    external_controller: str = "127.0.0.1:9090"
-    secret: str = ""
-    log_level: str = "info"
-
-
-@dataclass
 class ProbeConfig:
     """探针引擎配置。"""
 
@@ -48,15 +37,6 @@ class ModelConfig:
 
 
 @dataclass
-class SelectorConfig:
-    """选择器配置。"""
-
-    top_n: int = 3
-    min_score: float = 0.5
-    group: str = "GLOBAL"   # mihomo 代理组名 (见 config/mihomo.template.yaml)
-
-
-@dataclass
 class BanditConfig:
     """在线学习 (Bandit) 配置。"""
 
@@ -65,17 +45,6 @@ class BanditConfig:
     min_selections: int = 5            # 最少选择次数 (预留)
     state_path: str = "models/bandit_state.json"  # 学习状态持久化路径
     reward_window_min: int = 30         # 计算奖励的历史窗口 (分钟)
-
-
-@dataclass
-class PoolConfig:
-    """动态节点池配置。"""
-
-    max_nodes: int = 100               # 节点池上限
-    prune_interval_min: int = 60       # 修剪节流间隔 (分钟)
-    score_window_min: int = 30         # 评估成功率的历史窗口 (分钟)
-    min_history: int = 5               # 至少多少条历史才评估
-    min_success_rate: float = 0.3      # 低于此成功率则淘汰
 
 
 @dataclass
@@ -102,13 +71,10 @@ class NodeSourceConfig:
 class Config:
     """全局配置。"""
 
-    mihomo: MihomoConfig = field(default_factory=MihomoConfig)
     probe: ProbeConfig = field(default_factory=ProbeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
-    selector: SelectorConfig = field(default_factory=SelectorConfig)
     node_source: NodeSourceConfig = field(default_factory=NodeSourceConfig)
     bandit: BanditConfig = field(default_factory=BanditConfig)
-    pool: PoolConfig = field(default_factory=PoolConfig)
     collect: CollectConfig = field(default_factory=CollectConfig)
 
     @classmethod
@@ -119,12 +85,9 @@ class Config:
             return cls()
         raw = yaml.safe_load(path.read_text()) or {}
         return cls(
-            mihomo=MihomoConfig(**raw.get("mihomo", {})),
             probe=ProbeConfig(**raw.get("probe", {})),
             model=ModelConfig(**raw.get("model", {})),
-            selector=SelectorConfig(**raw.get("selector", {})),
             node_source=NodeSourceConfig(**raw.get("node_source", {})),
             bandit=BanditConfig(**raw.get("bandit", {})),
-            pool=PoolConfig(**raw.get("pool", {})),
             collect=CollectConfig(**raw.get("collect", {})),
         )
