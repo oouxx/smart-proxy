@@ -6,6 +6,19 @@
 #   3. 本文件不含敏感信息，可安全提交到仓库
 #
 # 注意: config/ 目录整体被 .gitignore 忽略，本文件通过白名单例外保留。
+#
+# ===== 快速更替场景调优 =====
+# 当节点池新节点大量涌入、旧节点快速淘汰时，离线模型因缺乏单节点历史积累
+# 而排序能力下降，应更依赖实时评分，并加快节点同步与淘汰。推荐:
+#   probe.fast_interval_sec: 5        # 新节点快速探测
+#   probe.bad_after_failures: 2      # 更快降级
+#   probe.dead_after_failures: 5     # 更快淘汰
+#   probe.recovery_successes: 2
+#   model.model_weight: 0.4          # 降低离线模型权重
+#   model.realtime_weight: 0.6       # 提高实时评分权重
+#   model.min_train_samples: 50      # 提高自动重训门槛，避免噪声
+#   node_source.refresh_interval_sec: 60  # 更频繁同步订阅
+# (serve 会按 refresh_interval_sec 周期性同步节点源: 新增节点/淘汰降级节点/清理 Bandit)
 
 probe:
   interval_sec: 60                   # 活跃节点周期探测间隔 (秒)

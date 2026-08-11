@@ -110,6 +110,29 @@ uv run mihomo-smart --config config/config.yaml smart
 | `bandit` | 在线学习: UCB1 探索系数、epsilon-greedy 概率、状态持久化路径 |
 | `collect` | 定时采集: 特征数据 CSV 输出路径 |
 
+## 快速更替场景调优
+
+当节点池**新节点大量涌入、旧节点快速淘汰**时，离线模型因缺乏单节点历史积累而
+排序能力下降，系统应更依赖实时评分，并加快节点同步与淘汰。推荐配置：
+
+```yaml
+probe:
+  fast_interval_sec: 5        # 新节点快速探测间隔
+  bad_after_failures: 2       # 更快降级为 BAD
+  dead_after_failures: 5      # 更快淘汰为 DEAD
+  recovery_successes: 2       # 恢复所需连续成功次数
+model:
+  model_weight: 0.4           # 降低离线模型权重
+  realtime_weight: 0.6        # 提高实时评分权重 (更依赖最近探测)
+  min_train_samples: 50       # 提高自动重训门槛，避免低样本噪声
+node_source:
+  refresh_interval_sec: 60   # 更频繁同步订阅，及时纳入新节点/淘汰旧节点
+```
+
+> 说明：`serve` 会按 `node_source.refresh_interval_sec` 周期性同步节点源——
+> 新增订阅节点、淘汰已不在订阅且已降级 (BAD/DEAD) 的节点，并清理对应 Bandit 臂。
+> 快速更替下建议调小该间隔，避免新节点长期不被探测、僵尸臂无限堆积。
+
 ## 开发计划
 
 - [x] Phase 1: 节点管理 + 主动探测 + 实时评分
@@ -170,6 +193,44 @@ timestamp,node_id,protocol,country_name,latency_avg_5m,...,score,bandit_reward,b
 - **交互特征**: 延迟×丢包率、延迟×(1-成功率) 捕捉联合影响
 - **模型自动更新**: collect 可定时自动重训 (默认 72 小时)
 - **数据保留期**: 特征数据超过 14 天自动清理
+
+## 用 mihomo smart 组件训练自己的模型
+
+项目已把 Go 内核切换到 **vernesong/mihomo** (含 smart 组件)。smart 组件会在代理
+真实流量时自动采集训练样本，可用它训练**你自己的节点**的 LightGBM 模型。
+
+### 1. 运行代理采集真实流量
+
+```bash
+# 编译 vernesong/mihomo 二进制 (含 smart 组件)
+cd go && go build -o ../bin/mihomo .
+
+# 用 smart 代理配置启动 (引用 config/mihomo.yaml 你的节点池)
+../bin/mihomo -d . -f ../config/mihomo-smart-proxy.yaml
+```
+
+把系统/应用代理指向 `mixed-port` (默认 7890)，真实流量经过 `SMART` 组后，
+smart 组件把训练样本写入 `<home>/smart_weight_data.csv`。
+
+### 2. 训练模型
+
+```bash
+python scripts/train_smart.py --csv <home>/smart_weight_data.csv --output <home>/Model.bin
+```
+
+脚本会计算 StandardScaler/RobustScaler 参数、训练 LightGBM 回归，并生成带
+`[transforms]` 段的模型文件 (mihomo 加载时自动应用缩放)。
+
+### 3. 验证模型
+
+```bash
+cd go && go run ./cmd/smart-verify <home>/Model.bin
+```
+
+验证模型能被 mihomo smart 组件解析并预测权重。
+
+> 说明: 训练数据来自**真实流量遥测** (流量 MB/时长/占比等)，需积累足够样本
+> (建议 ≥1000 条) 再训练。相关配置见 `config/mihomo-smart-proxy.yaml`。
 
 ## Docker 部署
 

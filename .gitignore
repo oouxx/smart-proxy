@@ -57,3 +57,4 @@ logs/
 config/
 # 但保留不含敏感信息的配置模板
 !config.example.yaml
+!config/mihomo-smart-proxy.yaml
