@@ -212,6 +212,16 @@ cd go && go build -o ../bin/mihomo .
 把系统/应用代理指向 `mixed-port` (默认 7890)，真实流量经过 `SMART` 组后，
 smart 组件把训练样本写入 `<home>/smart_weight_data.csv`。
 
+**没有真实用户流量？用脚本模拟** (mihomo 仍需作为代理运行，脚本负责制造流量)：
+
+```bash
+# 批量通过代理访问 YouTube/Google/GitHub 等，下载/上传数据
+python scripts/simulate_traffic.py --proxy http://127.0.0.1:7890 --duration 600
+```
+
+脚本会随机访问真实站点、下载测速文件、上传数据，制造 smart 组件需要的
+流量特征 (download_mb/upload_mb/时长/速率等)。并发和时长可调。
+
 ### 2. 训练模型
 
 ```bash

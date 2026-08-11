@@ -42,6 +42,19 @@ def _bandit_reward(history: list, window_min: int = 0) -> float:
     return max(0.0, min(1.0, 0.5 * success_rate + 0.3 * latency_score + 0.2 * speed_score))
 
 
+def _smart_score(node, history: list, intelligence=None) -> float:
+    """节点分数: 优先用 mihomo smart 组件权重 (Go 探针返回)，否则回退实时评分。
+
+    smart 权重需累积多次探测 (DefaultMinSampleCount=2) 才有非零值；
+    无权重时 (新节点/模型未加载) 用实时评分兜底，保证新节点仍有分。
+    """
+    if history and history[-1].weight is not None:
+        return float(history[-1].weight)
+    if intelligence is not None:
+        return intelligence.score_node(node, history)
+    return 0.0
+
+
 def _apply_node_status(
     nodes,
     probe,
@@ -148,7 +161,7 @@ def smart(ctx: click.Context) -> None:
                 protocol=str(node_cfg.get("type", "unknown")).lower(),
                 country=node_cfg.get("country", ""),
             )
-            score = intelligence.score_node(node, [result])
+            score = _smart_score(node, [result], intelligence)
             scored.append((score, node_cfg))
 
         scored.sort(key=lambda kv: kv[0], reverse=True)
@@ -373,7 +386,7 @@ async def run_collect(cfg, out_path: str | None = None) -> None:
             country=node_cfg.get("country", ""),
         )
         feats = features.build_features(node, [result])
-        score = intelligence.score_node(node, [result])
+        score = _smart_score(node, [result], intelligence)
         reward = _bandit_reward([result], cfg.bandit.reward_window_min)
         bandit.update(result.node_id, reward)
         pending.append((node, feats, score, reward))

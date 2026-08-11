@@ -33,6 +33,8 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/component/smart"
+	"github.com/metacubex/mihomo/component/smart/lightgbm"
 	C "github.com/metacubex/mihomo/constant"
 	"gopkg.in/yaml.v3"
 )
@@ -55,6 +57,7 @@ type ProbeResult struct {
 	DownloadSpeedKbps *float64 `json:"download_speed_kbps"`
 	UploadSpeedKbps   *float64 `json:"upload_speed_kbps"`
 	FirstByteMS       *float64 `json:"first_byte_ms"`
+	Weight            *float64 `json:"weight"` // mihomo smart 组件打分
 }
 
 // ProbeRequest 探测请求。
@@ -63,6 +66,7 @@ type ProbeRequest struct {
 	Server         string `json:"server"`
 	Port           int    `json:"port"`
 	TLS            bool   `json:"tls"`
+	Protocol       string `json:"protocol"` // 节点协议 (vmess/vless/trojan/ss/hysteria...)
 	ProbeURL       string `json:"probe_url"`
 	DownloadURL    string `json:"download_url"`
 	UploadURL      string `json:"upload_url"`
@@ -175,6 +179,7 @@ func probeAll(req ProbeAllRequest) []ProbeResult {
 			name, _ := node["name"].(string)
 			pr := ProbeRequest{
 				NodeID:         name,
+				Protocol:       protocolOf(node),
 				ProbeURL:       req.ProbeURL,
 				DownloadURL:    req.DownloadURL,
 				UploadURL:      req.UploadURL,
@@ -186,6 +191,117 @@ func probeAll(req ProbeAllRequest) []ProbeResult {
 	}
 	wg.Wait()
 	return results
+}
+
+// protocolOf 从节点配置提取协议类型。
+func protocolOf(node map[string]any) string {
+	if t, ok := node["type"].(string); ok {
+		return t
+	}
+	return ""
+}
+
+// nodeState 每节点累积探测状态 (用于构造 smart.ModelInput)。
+// 探针引擎跨请求累积，使 smart 组件能基于多次探测打分。
+type nodeState struct {
+	Success          int64
+	Failure          int64
+	LatencySum       float64
+	LatencyCount     int64
+	LossSum          float64
+	LossCount        int64
+	DownloadBytes    float64
+	UploadBytes      float64
+	MaxDownloadRate  float64 // bytes/sec
+	MaxUploadRate    float64 // bytes/sec
+	DurationMinutes  float64
+	LastUsed         int64
+	LastLatency      float64
+	LastLoss         float64
+	LastConnectMS    float64
+	LastDownloadKbps float64
+	LastUploadKbps   float64
+}
+
+var nodeStates = struct {
+	sync.Mutex
+	m map[string]*nodeState
+}{m: make(map[string]*nodeState)}
+
+// scoreNode 用 mihomo smart 组件对节点打分，并把权重写入 result。
+// 基于累积状态构造 ModelInput，调用 PredictWeight (样本不足时回退 CalculateWeight)。
+func scoreNode(nodeID, protocol string, result *ProbeResult, downloadBytes, uploadBytes, durationSec float64) {
+	nodeStates.Lock()
+	st := nodeStates.m[nodeID]
+	if st == nil {
+		st = &nodeState{}
+		nodeStates.m[nodeID] = st
+	}
+	// 更新累积状态
+	if result.Success {
+		st.Success++
+	} else {
+		st.Failure++
+	}
+	if result.LatencyMS != nil {
+		st.LatencySum += *result.LatencyMS
+		st.LatencyCount++
+		st.LastLatency = *result.LatencyMS
+	}
+	if result.PacketLoss != nil {
+		st.LossSum += *result.PacketLoss
+		st.LossCount++
+		st.LastLoss = *result.PacketLoss
+	}
+	if result.TCPConnectMS != nil {
+		st.LastConnectMS = *result.TCPConnectMS
+	}
+	st.DownloadBytes += downloadBytes
+	st.UploadBytes += uploadBytes
+	if result.DownloadSpeedKbps != nil {
+		rate := *result.DownloadSpeedKbps * 1000 / 8 // kbps -> bytes/sec
+		if rate > st.MaxDownloadRate {
+			st.MaxDownloadRate = rate
+		}
+		st.LastDownloadKbps = *result.DownloadSpeedKbps
+	}
+	if result.UploadSpeedKbps != nil {
+		rate := *result.UploadSpeedKbps * 1000 / 8
+		if rate > st.MaxUploadRate {
+			st.MaxUploadRate = rate
+		}
+		st.LastUploadKbps = *result.UploadSpeedKbps
+	}
+	st.DurationMinutes += durationSec / 60
+	st.LastUsed = time.Now().Unix()
+	nodeStates.Unlock()
+
+	// 构造 ModelInput
+	isUDP := protocol == "hysteria" || protocol == "hysteria2"
+	input := &smart.ModelInput{
+		Success:            st.Success,
+		Failure:            st.Failure,
+		ConnectTime:        int64(st.LastConnectMS),
+		Latency:            int64(st.LastLatency),
+		UploadTotal:        st.UploadBytes,
+		DownloadTotal:      st.DownloadBytes,
+		MaxuploadRate:      st.MaxUploadRate,
+		MaxdownloadRate:    st.MaxDownloadRate,
+		ConnectionDuration: st.DurationMinutes,
+		LastUsed:           st.LastUsed,
+		IsUDP:              isUDP,
+		IsTCP:              !isUDP,
+		LossRate:           st.LastLoss,
+		CumulLossRate:      st.LossSum / float64(max(st.LossCount, 1)),
+		DestPort:           443,
+		Host:               "www.gstatic.com",
+	}
+
+	model := lightgbm.GetModel()
+	weight, ok := model.PredictWeight(input, 1.0)
+	if ok {
+		result.Weight = ptrFloat(weight)
+	}
 }
 
 // probeViaMihomo 通过 mihomo 库建立真实代理隧道，测量经代理访问目标的指标。
@@ -250,8 +366,10 @@ func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, t
 	result.SuccessRate = ptrFloat(stats.successRate)
 
 	// 3. 下载速度 + 首字节时间 (经隧道)
+	var downloadBytes int64
 	if req.DownloadURL != "" {
-		speed, firstByte := measureDownload(client, req.DownloadURL, timeout)
+		speed, firstByte, total := measureDownload(client, req.DownloadURL, timeout)
+		downloadBytes = total
 		if speed != nil {
 			result.DownloadSpeedKbps = speed
 		}
@@ -261,13 +379,19 @@ func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, t
 	}
 
 	// 4. 上传速度 (经隧道)
+	var uploadBytes int64
 	if req.UploadURL != "" {
-		if speed := measureUpload(client, req.UploadURL, timeout); speed != nil {
+		speed, total := measureUpload(client, req.UploadURL, timeout)
+		uploadBytes = total
+		if speed != nil {
 			result.UploadSpeedKbps = speed
 		}
 	}
 
 	result.Success = true
+
+	// 5. 用 mihomo smart 组件打分 (基于累积状态)
+	scoreNode(req.NodeID, req.Protocol, result, float64(downloadBytes), float64(uploadBytes), 0)
 }
 
 // measureLatency 通过给定 client 发送多次 HTTP 请求测量延迟，返回成功请求的延迟列表。
@@ -299,16 +423,16 @@ func measureLatency(client *http.Client, url string, samples int) []float64 {
 	return latencies
 }
 
-// measureDownload 通过给定 client 下载测试文件测量速度 (KB/s) 和首字节时间 (ms)。
-func measureDownload(client *http.Client, url string, timeout time.Duration) (*float64, *float64) {
+// measureDownload 通过给定 client 下载测试文件测量速度 (KB/s)、首字节时间 (ms) 和总字节数。
+func measureDownload(client *http.Client, url string, timeout time.Duration) (*float64, *float64, int64) {
 	start := time.Now()
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, nil
+		return nil, nil, 0
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, nil
+		return nil, nil, 0
 	}
 	firstByte := float64(time.Since(start).Microseconds()) / 1000.0
 
@@ -328,10 +452,10 @@ func measureDownload(client *http.Client, url string, timeout time.Duration) (*f
 	}
 	elapsed := time.Since(dlStart).Seconds()
 	if elapsed <= 0 {
-		return nil, &firstByte
+		return nil, &firstByte, total
 	}
 	speedKbps := float64(total) * 8 / 1000 / elapsed
-	return &speedKbps, &firstByte
+	return &speedKbps, &firstByte, total
 }
 
 func avgFloat(vals []float64) float64 {
@@ -388,23 +512,23 @@ func percentile(sorted []float64, p float64) float64 {
 }
 
 // measureUpload 通过给定 client POST 固定大小数据测量上传速度 (KB/s)。
-func measureUpload(client *http.Client, url string, timeout time.Duration) *float64 {
+func measureUpload(client *http.Client, url string, timeout time.Duration) (*float64, int64) {
 	payload := bytes.Repeat([]byte{0}, 1<<20) // 1MB
 	start := time.Now()
 	resp, err := client.Post(url, "application/octet-stream", bytes.NewReader(payload))
 	if err != nil {
-		return nil
+		return nil, 0
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil
+		return nil, 0
 	}
 	elapsed := time.Since(start).Seconds()
 	if elapsed <= 0 {
-		return nil
+		return nil, int64(len(payload))
 	}
 	speedKbps := float64(len(payload)) * 8 / 1000 / elapsed
-	return &speedKbps
+	return &speedKbps, int64(len(payload))
 }
 
 // jitter 计算延迟抖动 (平均绝对偏差)。
@@ -427,7 +551,14 @@ func jitter(vals []float64) float64 {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9100", "探针 HTTP 服务地址")
 	configPath := flag.String("config", "config/mihomo.yaml", "节点订阅文件路径 (用于 mihomo 隧道探测)")
+	modelDir := flag.String("model-dir", "", "mihomo smart 模型目录 (含 Model.bin，留空则用 CalculateWeight 启发式)")
 	flag.Parse()
+
+	// 设置 smart 模型目录 (若指定，则 smart 组件从 <dir>/Model.bin 加载模型)
+	if *modelDir != "" {
+		C.SetHomeDir(*modelDir)
+		log.Printf("smart 模型目录: %s", *modelDir)
+	}
 
 	// 加载节点订阅文件 (失败则退化为纯直连探测)
 	if err := loadProxies(*configPath); err != nil {

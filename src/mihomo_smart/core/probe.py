@@ -49,6 +49,7 @@ class ProbeResult:
     download_speed_kbps: float | None = None
     upload_speed_kbps: float | None = None
     first_byte_ms: float | None = None
+    weight: float | None = None  # mihomo smart 组件打分 (0~1.3 左右)
 
 
 class ProbeEngine:
@@ -207,6 +208,7 @@ class ProbeEngine:
             "node_id": node.node_id,
             "server": node.server,
             "port": node.port,
+            "protocol": node.protocol,
             "tls": node.protocol.lower() in _TLS_PROTOCOLS,
             "probe_url": self.cfg.probe_url,
             "download_url": self.cfg.download_url,
@@ -285,6 +287,7 @@ class ProbeEngine:
             download_speed_kbps=data.get("download_speed_kbps"),
             upload_speed_kbps=data.get("upload_speed_kbps"),
             first_byte_ms=data.get("first_byte_ms"),
+            weight=data.get("weight"),
         )
 
     def history(self, node_id: str, window_sec: int | None = None) -> list[ProbeResult]:
