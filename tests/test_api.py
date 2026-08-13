@@ -55,10 +55,12 @@ def test_empty_state_backward_compatible():
     assert client.get("/scores").json() == {"scores": {}}
 
 
-def test_download_smart_exists():
-    """config/mihomo-smart.yaml 存在时应能下载。"""
+def test_download_smart_exists(tmp_path):
+    """output 文件存在时应能下载 (自包含, 不依赖仓库里的 config/)。"""
+    out = tmp_path / "mihomo-smart.yaml"
+    out.write_text("proxies: []\n")
     cfg = Config()
-    cfg.node_source.output = "config/mihomo-smart.yaml"
+    cfg.node_source.output = str(out)
     client = TestClient(create_app(cfg))
     assert client.get("/download/smart").status_code == 200
 
