@@ -1,5 +1,6 @@
 """Probe Engine 与 Go 探针的 HTTP 集成测试。"""
 import asyncio
+import socket
 
 import pytest
 
@@ -8,28 +9,37 @@ from mihomo_smart.core.node_manager import NodeManager, ProxyNode
 from mihomo_smart.core.probe import ProbeEngine
 
 
+def _free_port() -> int:
+    """获取一个随机空闲端口, 避免与残留探针进程冲突。"""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 @pytest.mark.asyncio
 async def test_probe_engine_calls_go_probe():
-    """启动 Go 探针子进程，验证 HTTP 调用返回真实探测结果。"""
-    # 本地起一个 TCP 服务作为探测目标，保证测试确定且不依赖外网
-    # handler 需关闭连接，否则 server.wait_closed() 会永远等待
+    """验证 Python ProbeEngine 通过 HTTP 调用 Go 探针并返回结果。
+
+    用 /probe_all (节点直接传入请求, 不依赖订阅文件)。目标指向本地立即关闭的
+    TCP 服务, ss 隧道握手快速失败 -> success=False, 验证 HTTP 集成链路。
+    """
+    # 本地 TCP 服务, 接受连接后立即关闭 (非真实 ss 服务, 握手会快速失败)
     server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
-    cfg = ProbeConfig(engine_binary="bin/probe-engine", engine_addr="127.0.0.1:9101")
-    nodes = NodeManager()
-    nodes.add(ProxyNode(node_id="test-1", server="127.0.0.1", port=port, protocol="ss"))
-
-    engine = ProbeEngine(cfg, nodes)
+    cfg = ProbeConfig(engine_binary="bin/probe-engine", engine_addr=f"127.0.0.1:{_free_port()}")
+    engine = ProbeEngine(cfg, NodeManager())
     await engine.start_engine()
     try:
-        node = nodes.get("test-1")
-        assert node is not None
-        result = await engine._probe_node(node)
-        # 本地 TCP 应能建立连接
-        assert result.node_id == "test-1"
-        assert result.tcp_connect_ms is not None
-        assert result.success is True
+        nodes = [
+            {"name": "test-1", "type": "ss", "server": "127.0.0.1", "port": port,
+             "cipher": "aes-128-gcm", "password": "x"},
+        ]
+        results = await engine.probe_all(nodes)
+        assert len(results) == 1
+        assert results[0].node_id == "test-1"
+        # 非真实 ss 服务, 隧道握手失败 -> success=False (快速返回)
+        assert results[0].success is False
     finally:
         await engine.stop_engine()
         server.close()
@@ -39,7 +49,7 @@ async def test_probe_engine_calls_go_probe():
 @pytest.mark.asyncio
 async def test_probe_engine_handles_unreachable_node():
     """不可达节点应返回 success=False 而非抛异常。"""
-    cfg = ProbeConfig(engine_binary="bin/probe-engine", engine_addr="127.0.0.1:9102")
+    cfg = ProbeConfig(engine_binary="bin/probe-engine", engine_addr=f"127.0.0.1:{_free_port()}")
     nodes = NodeManager()
     # 使用保留地址，确保连接失败
     nodes.add(ProxyNode(node_id="dead-1", server="192.0.2.1", port=9, protocol="ss"))
@@ -59,7 +69,8 @@ async def test_probe_engine_handles_unreachable_node():
 @pytest.mark.asyncio
 async def test_start_engine_reuses_existing():
     """端口已有探针在服务时，start_engine 应复用而非重复启动。"""
-    cfg = ProbeConfig(engine_binary="bin/probe-engine", engine_addr="127.0.0.1:9103")
+    port = _free_port()
+    cfg = ProbeConfig(engine_binary="bin/probe-engine", engine_addr=f"127.0.0.1:{port}")
     engine1 = ProbeEngine(cfg, NodeManager())
     await engine1.start_engine()
     try:

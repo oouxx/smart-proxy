@@ -41,8 +41,7 @@ jobs:
         run: uv run ruff check src/ tests/
 
       - name: Test (pytest)
-        # test_probe_engine_calls_go_probe 依赖真实订阅节点, CI 中跳过
-        run: uv run pytest tests/ -q -k "not test_probe_engine_calls_go_probe"
+        run: uv run pytest tests/ -q
 
   # ---------- Build & Push Docker image ----------
   build:
