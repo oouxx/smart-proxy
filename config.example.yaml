@@ -7,6 +7,21 @@
 #
 # 注意: config/ 目录整体被 .gitignore 忽略，本文件通过白名单例外保留。
 #
+# ===== 推荐: 全自动训练 + 多站点探测 =====
+# 用探针覆盖全部节点、多站点综合打分，自动训练自己的 smart 模型，全程无需手动干预:
+#
+#   probe:
+#     collect_csv: true        # 开启探针采集 (多站点覆盖全部节点)
+#     model_dir: models/smart  # 模型目录 (存放 smart_weight_data.csv 与 Model.bin)
+#     use_model: true          # 训练完成后用自己训练的 Model.bin 打分
+#   collect:
+#     smart_auto_train: true   # collect 完成后自动重训 smart 模型
+#     smart_min_samples: 1000  # 样本数达到该值才自动训练
+#     smart_interval_hours: 24 # 自动重训间隔 (小时)
+#
+# serve 的 cron collect 每小时采集一次; 样本足够且距上次训练超过间隔时自动重训 Model.bin。
+# 采集阶段想避免加载预训练模型时, 可临时把 probe.use_model 改为 false (纯 CalculateWeight 启发式)。
+#
 # ===== 快速更替场景调优 =====
 # 当节点池新节点大量涌入、旧节点快速淘汰时，离线模型因缺乏单节点历史积累
 # 而排序能力下降，应更依赖实时评分，并加快节点同步与淘汰。推荐:
@@ -25,13 +40,23 @@ probe:
   fast_interval_sec: 10             # 新节点快速探测间隔 (秒)
   timeout_ms: 5000                  # 单次探测超时 (毫秒)
   concurrency: 20                   # 并发探测数
-  probe_url: "https://www.gstatic.com/generate_204"
-  download_url: ""                  # 下载测速 URL，留空则跳过测速
-  upload_url: ""                    # 上传测速 URL，留空则跳过测速
+  probe_urls:                       # 多个探测目标站点 (综合打分)
+    - "https://www.gstatic.com/generate_204"
+    - "https://www.google.com/generate_204"
+    - "https://www.youtube.com"
+    - "https://github.com"
+    - "https://www.cloudflare.com"
+    - "https://www.wikipedia.org"
+    - "https://www.microsoft.com"
+  download_urls: []                 # 下载测速 URL 列表，留空则跳过测速
+  upload_urls: []                   # 上传测速 URL 列表，留空则跳过测速
   latency_samples: 5                # 延迟采样次数
   engine_binary: bin/probe-engine   # Go 探针二进制路径
   engine_addr: 127.0.0.1:9100       # Go 探针 HTTP 服务地址
   engine_config: config/mihomo.yaml # 节点订阅文件路径 (mihomo 隧道探测)
+  model_dir: models/smart           # smart 模型目录 (含 Model.bin 与 smart_weight_data.csv)
+  use_model: true                   # 是否加载 Model.bin 打分 (false 则用 CalculateWeight 启发式)
+  collect_csv: false                # 是否采集训练数据 (探针覆盖全部节点, 写 smart_weight_data.csv)
   # 节点健康状态机阈值 (快速更替场景可调小淘汰参数)
   bad_after_failures: 3             # 连续失败多少次降为 BAD
   dead_after_failures: 10           # 连续失败多少次降为 DEAD (可被淘汰)
@@ -65,3 +90,8 @@ collect:
   output: data/features.csv         # 特征数据 CSV 输出路径 (每小时追加)
   retention_days: 14                # 特征数据保留期 (天)，超过则清理
   schedule: "0 * * * *"             # cron 表达式，serve 内定时跑 collect
+  # 自动训练 smart 模型 (探针采集的 smart_weight_data.csv -> Model.bin)
+  # 需要 probe.collect_csv: true 且 probe.model_dir 已设置
+  smart_auto_train: false           # collect 完成后自动重训 smart 模型
+  smart_min_samples: 1000           # 最少训练样本数
+  smart_interval_hours: 24          # 自动重训间隔 (小时)

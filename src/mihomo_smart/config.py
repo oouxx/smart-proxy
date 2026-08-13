@@ -18,13 +18,25 @@ class ProbeConfig:
     fast_interval_sec: int = 10     # 新节点快速探测间隔
     timeout_ms: int = 5000
     concurrency: int = 20
-    probe_url: str = "https://www.gstatic.com/generate_204"
-    download_url: str = ""          # 下载测速 URL，为空则跳过测速
-    upload_url: str = ""            # 上传测速 URL，为空则跳过测速
+    probe_url: str = ""                       # 兼容字段: 单个探测目标 (建议用 probe_urls)
+    probe_urls: list[str] = field(default_factory=lambda: [  # 多个探测目标站点 (综合打分)
+        "https://www.gstatic.com/generate_204",
+        "https://www.google.com/generate_204",
+        "https://www.youtube.com",
+        "https://github.com",
+        "https://www.cloudflare.com",
+        "https://www.wikipedia.org",
+        "https://www.microsoft.com",
+    ])
+    download_urls: list[str] = field(default_factory=list)  # 下载测速 URL 列表 (留空则跳过)
+    upload_urls: list[str] = field(default_factory=list)    # 上传测速 URL 列表 (留空则跳过)
     latency_samples: int = 5         # 延迟采样次数
     engine_binary: str = "bin/probe-engine"  # Go 探针二进制路径
     engine_addr: str = "127.0.0.1:9100"     # Go 探针 HTTP 服务地址
     engine_config: str = "config/mihomo.yaml"  # 节点订阅文件路径 (mihomo 隧道探测)
+    model_dir: str = ""                      # smart 模型目录 (含 Model.bin 与 smart_weight_data.csv)
+    use_model: bool = True                    # 是否加载 Model.bin 打分 (False 则用 CalculateWeight 启发式)
+    collect_csv: bool = False                 # 是否采集训练数据 (探针覆盖全部节点, 写 smart_weight_data.csv)
     # 节点健康状态机阈值 (快速更替场景可调小)
     bad_after_failures: int = 3          # 连续失败多少次降为 BAD
     dead_after_failures: int = 10        # 连续失败多少次降为 DEAD (可被淘汰)
@@ -62,6 +74,10 @@ class CollectConfig:
     output: str = "data/features.csv"  # 特征数据 CSV 输出路径 (每小时追加)
     retention_days: int = 14            # 特征数据保留期 (天)，超过则清理
     schedule: str = "0 * * * *"         # cron 表达式，serve 内定时跑 collect
+    # 自动训练 smart 模型 (探针采集的 smart_weight_data.csv -> Model.bin)
+    smart_auto_train: bool = False      # collect 完成后自动重训 smart 模型
+    smart_min_samples: int = 1000       # 最少训练样本数 (需 probe.collect_csv 采集到足够数据)
+    smart_interval_hours: int = 24      # 自动重训间隔 (小时)
 
 
 @dataclass

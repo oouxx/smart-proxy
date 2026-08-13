@@ -89,15 +89,21 @@ class ProbeEngine:
             self._owns_proc = False
             return
         logger.info("启动探针引擎: %s", self.cfg.engine_binary)
+        cmd = [
+            self.cfg.engine_binary,
+            "-addr",
+            self.cfg.engine_addr,
+            "-config",
+            self.cfg.engine_config,
+        ]
+        if self.cfg.model_dir:
+            cmd += ["-model-dir", self.cfg.model_dir]
+        cmd.append(f"-use-model={str(self.cfg.use_model).lower()}")
+        if self.cfg.collect_csv:
+            cmd.append("-collect-csv=true")
         self._proc = await asyncio.to_thread(
             subprocess.Popen,
-            [
-                self.cfg.engine_binary,
-                "-addr",
-                self.cfg.engine_addr,
-                "-config",
-                self.cfg.engine_config,
-            ],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -204,15 +210,18 @@ class ProbeEngine:
 
     async def _probe_node(self, node: ProxyNode) -> ProbeResult:
         """对单个节点执行探测，通过 HTTP 调用 Go 探针。"""
+        probe_urls = list(self.cfg.probe_urls)
+        if not probe_urls and self.cfg.probe_url:
+            probe_urls = [self.cfg.probe_url]
         payload = {
             "node_id": node.node_id,
             "server": node.server,
             "port": node.port,
             "protocol": node.protocol,
             "tls": node.protocol.lower() in _TLS_PROTOCOLS,
-            "probe_url": self.cfg.probe_url,
-            "download_url": self.cfg.download_url,
-            "upload_url": self.cfg.upload_url,
+            "probe_urls": probe_urls,
+            "download_urls": list(self.cfg.download_urls),
+            "upload_urls": list(self.cfg.upload_urls),
             "timeout_ms": self.cfg.timeout_ms,
             "latency_samples": self.cfg.latency_samples,
         }
@@ -232,11 +241,14 @@ class ProbeEngine:
 
         nodes: 完整节点配置列表 (proxies 数组)。
         """
+        probe_urls = list(self.cfg.probe_urls)
+        if not probe_urls and self.cfg.probe_url:
+            probe_urls = [self.cfg.probe_url]
         payload = {
             "nodes": nodes,
-            "probe_url": self.cfg.probe_url,
-            "download_url": self.cfg.download_url,
-            "upload_url": self.cfg.upload_url,
+            "probe_urls": probe_urls,
+            "download_urls": list(self.cfg.download_urls),
+            "upload_urls": list(self.cfg.upload_urls),
             "timeout_ms": self.cfg.timeout_ms,
             "latency_samples": self.cfg.latency_samples,
             "concurrency": self.cfg.concurrency,

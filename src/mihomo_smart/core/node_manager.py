@@ -31,10 +31,8 @@ class ProxyNode:
     port: int
     protocol: str
     country: str = ""
-    isp: str = ""
     status: NodeStatus = NodeStatus.NEW
     created_time: float = field(default_factory=time.time)
-    tags: set[str] = field(default_factory=set)
 
     # 合法状态迁移表 (迁移到集合外的状态视为非法)
     _VALID_TRANSITIONS: ClassVar[dict[NodeStatus, set[NodeStatus]]] = {
@@ -80,8 +78,3 @@ class NodeManager:
         node = self._nodes.get(node_id)
         if node:
             node.transition(status)
-
-    def add_tag(self, node_id: str, tag: str) -> None:
-        node = self._nodes.get(node_id)
-        if node:
-            node.tags.add(tag)

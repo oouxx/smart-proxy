@@ -2,22 +2,64 @@
 #
 # 用法:
 #   1. 准备配置: cp config.example.yaml config/config.yaml (按需修改)
-#   2. 构建并启动: docker compose up -d --build
-#   3. 查看日志: docker compose logs -f
+#   2. 准备环境变量: cp .env.example .env (按需修改端口/目录/时区)
+#   3. 构建并启动: docker compose up -d --build
+#   4. 查看日志:   docker compose logs -f
 #
 # 单服务架构:
 #   serve 进程同时提供 HTTP 下载 (端口 8000) 和 cron 定时 collect
 #   (collect 的 cron 表达式在 config.yaml 的 collect.schedule 配置)
+#
+# 训练自己的模型 (多站点探针采集 -> 训练 Model.bin):
+#   方式 A (全自动): config.yaml 设 probe.collect_csv: true + collect.smart_auto_train: true
+#     serve 的 cron collect 每小时采集全部节点, 样本足够且到间隔时自动重训 Model.bin
+#   方式 B (手动):
+#     1. config.yaml 设 probe.collect_csv: true, 重启 serve 采集数据
+#     2. docker compose run --rm train
+#     3. 把 probe.use_model 改回 true, 探针即用自己训练的模型打分
+#
+# 数据通过挂载卷持久化: ./config、./data、./models (训练目录 ./models/smart)
+# 路径/端口/容器名/时区可在 .env 中覆盖。
 
 services:
   serve:
     build: .
-    container_name: mihomo-smart
+    image: mihomo-smart:latest     # 命名镜像, 供 train 服务复用
+    container_name: ${MIIHOMO_SMART_CONTAINER:-mihomo-smart}
     ports:
-      - "8000:8000"
+      - "${MIIHOMO_SMART_PORT:-8000}:8000"
     volumes:
-      - ./config:/app/config
-      - ./data:/app/data
-      - ./models:/app/models
+      - ${SMART_CONFIG_DIR:-./config}:/app/config
+      - ${SMART_DATA_DIR:-./data}:/app/data
+      - ${SMART_MODELS_DIR:-./models}:/app/models
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     # 默认 CMD 启动 serve (内含 APScheduler 按 collect.schedule 定时跑 collect)
+    # 若需临时关闭多站点采集, 可在 config.yaml 里设 probe.collect_csv: false
+
+  # 一次性训练服务: 从已采集的训练数据训练自己的 smart 模型
+  # 复用 serve 的镜像, 无需重复构建
+  train:
+    image: mihomo-smart:latest
+    container_name: ${MIIHOMO_SMART_CONTAINER:-mihomo-smart}-train
+    profiles: ["train"]          # 仅手动触发, 不随 up 启动
+    depends_on:
+      - serve                    # 确保 serve 镜像已构建
+    volumes:
+      - ${SMART_CONFIG_DIR:-./config}:/app/config
+      - ${SMART_DATA_DIR:-./data}:/app/data
+      - ${SMART_MODELS_DIR:-./models}:/app/models
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    restart: "no"
+    entrypoint: ["python", "scripts/train_smart.py"]
+    command: ["--csv", "models/smart/smart_weight_data.csv",
+              "--output", "models/smart/Model.bin"]

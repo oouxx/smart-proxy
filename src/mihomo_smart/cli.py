@@ -429,6 +429,24 @@ async def run_collect(cfg, out_path: str | None = None) -> None:
                 cfg.model.min_train_samples,
             )
 
+    # 6. smart 模型自动更新 (探针采集的 smart_weight_data.csv -> Model.bin)
+    if cfg.collect.smart_auto_train and cfg.probe.collect_csv and cfg.probe.model_dir:
+        import os
+
+        from .ml import smart_train
+
+        smart_csv = os.path.join(cfg.probe.model_dir, "smart_weight_data.csv")
+        smart_model = os.path.join(cfg.probe.model_dir, "Model.bin")
+        if os.path.exists(smart_csv) and smart_train.should_retrain(
+            smart_model, cfg.collect.smart_interval_hours
+        ):
+            ok, msg = smart_train.train_model(
+                [smart_csv], smart_model, cfg.collect.smart_min_samples
+            )
+            if ok:
+                logger.info("smart 模型自动重训完成: %s", msg)
+        # 样本不足/未到间隔 -> train_model 内部已记录日志, 静默跳过
+
     logger.info("完成: %d 个节点特征已追加到 %s (Bandit 已更新)", len(rows), out_path)
 
 

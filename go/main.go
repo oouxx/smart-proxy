@@ -62,25 +62,36 @@ type ProbeResult struct {
 
 // ProbeRequest 探测请求。
 type ProbeRequest struct {
-	NodeID         string `json:"node_id"`
-	Server         string `json:"server"`
-	Port           int    `json:"port"`
-	TLS            bool   `json:"tls"`
-	Protocol       string `json:"protocol"` // 节点协议 (vmess/vless/trojan/ss/hysteria...)
-	ProbeURL       string `json:"probe_url"`
-	DownloadURL    string `json:"download_url"`
-	UploadURL      string `json:"upload_url"`
-	TimeoutMS      int    `json:"timeout_ms"`
-	LatencySamples int    `json:"latency_samples"`
-	ConfigPath     string `json:"config_path"` // 节点订阅文件路径
+	NodeID         string   `json:"node_id"`
+	Server         string   `json:"server"`
+	Port           int      `json:"port"`
+	TLS            bool     `json:"tls"`
+	Protocol       string   `json:"protocol"` // 节点协议 (vmess/vless/trojan/ss/hysteria...)
+	ProbeURLs      []string `json:"probe_urls"`     // 多个探测目标站点 (综合打分)
+	DownloadURLs   []string `json:"download_urls"`  // 下载测速 URL 列表
+	UploadURLs     []string `json:"upload_urls"`    // 上传测速 URL 列表
+	TimeoutMS      int      `json:"timeout_ms"`
+	LatencySamples int      `json:"latency_samples"`
+	ConfigPath     string   `json:"config_path"` // 节点订阅文件路径
+}
+
+// defaultProbeURLs 默认探测目标 (综合多个真实站点打分, 融入 simulate_traffic 的多站点思路)。
+var defaultProbeURLs = []string{
+	"https://www.gstatic.com/generate_204",
+	"https://www.google.com/generate_204",
+	"https://www.youtube.com",
+	"https://github.com",
+	"https://www.cloudflare.com",
+	"https://www.wikipedia.org",
+	"https://www.microsoft.com",
 }
 
 // ProbeAllRequest 批量探测请求: 一次探测整个节点池。
 type ProbeAllRequest struct {
 	Nodes          []map[string]any `json:"nodes"`
-	ProbeURL       string           `json:"probe_url"`
-	DownloadURL    string           `json:"download_url"`
-	UploadURL      string           `json:"upload_url"`
+	ProbeURLs      []string         `json:"probe_urls"`
+	DownloadURLs   []string         `json:"download_urls"`
+	UploadURLs     []string         `json:"upload_urls"`
 	TimeoutMS      int              `json:"timeout_ms"`
 	LatencySamples int              `json:"latency_samples"`
 	Concurrency    int              `json:"concurrency"`
@@ -120,7 +131,7 @@ func loadProxies(path string) error {
 }
 
 // resolveProbeParams 解析探测公共参数 (超时/采样数/探测URL)。
-func resolveProbeParams(req ProbeRequest) (time.Duration, int, string) {
+func resolveProbeParams(req ProbeRequest) (time.Duration, int, []string) {
 	timeout := time.Duration(req.TimeoutMS) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -129,11 +140,19 @@ func resolveProbeParams(req ProbeRequest) (time.Duration, int, string) {
 	if samples <= 0 {
 		samples = 5
 	}
-	probeURL := req.ProbeURL
-	if probeURL == "" {
-		probeURL = "https://www.gstatic.com/generate_204"
+	probeURLs := req.ProbeURLs
+	if len(probeURLs) == 0 {
+		probeURLs = defaultProbeURLs
 	}
-	return timeout, samples, probeURL
+	return timeout, samples, probeURLs
+}
+
+func flushCollector() {
+	if collectTraining {
+		if c := lightgbm.GetCollector(); c != nil {
+			c.Flush()
+		}
+	}
 }
 
 // probe 对单个节点执行完整探测。
@@ -146,7 +165,9 @@ func probe(req ProbeRequest) ProbeResult {
 		log.Printf("节点 %s 不在订阅文件中，无法探测", req.NodeID)
 		return ProbeResult{NodeID: req.NodeID, Timestamp: time.Now().Unix()}
 	}
-	return probeWithConfig(cfg, req)
+	res := probeWithConfig(cfg, req)
+	flushCollector()
+	return res
 }
 
 // probeWithConfig 对给定节点配置执行 mihomo 隧道探测。
@@ -155,8 +176,8 @@ func probeWithConfig(cfg map[string]any, req ProbeRequest) ProbeResult {
 		NodeID:    req.NodeID,
 		Timestamp: time.Now().Unix(),
 	}
-	timeout, samples, probeURL := resolveProbeParams(req)
-	probeViaMihomo(cfg, req, &result, timeout, samples, probeURL)
+	timeout, samples, probeURLs := resolveProbeParams(req)
+	probeViaMihomo(cfg, req, &result, timeout, samples, probeURLs)
 	return result
 }
 
@@ -180,9 +201,9 @@ func probeAll(req ProbeAllRequest) []ProbeResult {
 			pr := ProbeRequest{
 				NodeID:         name,
 				Protocol:       protocolOf(node),
-				ProbeURL:       req.ProbeURL,
-				DownloadURL:    req.DownloadURL,
-				UploadURL:      req.UploadURL,
+				ProbeURLs:      req.ProbeURLs,
+				DownloadURLs:   req.DownloadURLs,
+				UploadURLs:     req.UploadURLs,
 				TimeoutMS:      req.TimeoutMS,
 				LatencySamples: req.LatencySamples,
 			}
@@ -190,6 +211,7 @@ func probeAll(req ProbeAllRequest) []ProbeResult {
 		}(i, node)
 	}
 	wg.Wait()
+	flushCollector()
 	return results
 }
 
@@ -228,21 +250,24 @@ var nodeStates = struct {
 	m map[string]*nodeState
 }{m: make(map[string]*nodeState)}
 
+// 运行时开关 (由 main 的 flags 设置)
+var (
+	collectTraining bool // 是否采集训练数据 (smart_weight_data.csv)
+	useLightGBM     bool // 是否用已加载模型打分 (false 则用 CalculateWeight 启发式)
+)
+
 // scoreNode 用 mihomo smart 组件对节点打分，并把权重写入 result。
 // 基于累积状态构造 ModelInput，调用 PredictWeight (样本不足时回退 CalculateWeight)。
-func scoreNode(nodeID, protocol string, result *ProbeResult, downloadBytes, uploadBytes, durationSec float64) {
+func scoreNode(nodeID, protocol string, result *ProbeResult, downloadBytes, uploadBytes, durationSec float64, meta *C.Metadata, successCount, failureCount int64) {
 	nodeStates.Lock()
 	st := nodeStates.m[nodeID]
 	if st == nil {
 		st = &nodeState{}
 		nodeStates.m[nodeID] = st
 	}
-	// 更新累积状态
-	if result.Success {
-		st.Success++
-	} else {
-		st.Failure++
-	}
+	// 更新累积状态 (按延迟采样数累积, 使一次探测即有足够样本触发 smart 打分)
+	st.Success += successCount
+	st.Failure += failureCount
 	if result.LatencyMS != nil {
 		st.LatencySum += *result.LatencyMS
 		st.LatencyCount++
@@ -276,8 +301,14 @@ func scoreNode(nodeID, protocol string, result *ProbeResult, downloadBytes, uplo
 	st.LastUsed = time.Now().Unix()
 	nodeStates.Unlock()
 
-	// 构造 ModelInput
+	// 构造 ModelInput (目标 host/port 来自真实探测目标)
 	isUDP := protocol == "hysteria" || protocol == "hysteria2"
+	dstHost := "www.gstatic.com"
+	dstPort := uint16(443)
+	if meta != nil {
+		dstHost = meta.Host
+		dstPort = meta.DstPort
+	}
 	input := &smart.ModelInput{
 		Success:            st.Success,
 		Failure:            st.Failure,
@@ -291,28 +322,72 @@ func scoreNode(nodeID, protocol string, result *ProbeResult, downloadBytes, uplo
 		LastUsed:           st.LastUsed,
 		IsUDP:              isUDP,
 		IsTCP:              !isUDP,
+		ConnectionFailed:   successCount == 0 && failureCount > 0,
 		LossRate:           st.LastLoss,
 		CumulLossRate:      st.LossSum / float64(max(st.LossCount, 1)),
-		DestPort:           443,
-		Host:               "www.gstatic.com",
+		DestPort:           dstPort,
+		Host:               dstHost,
+		NodeName:           nodeID,
+		GroupName:          "probe",
 	}
 
-	model := lightgbm.GetModel()
-	weight, ok := model.PredictWeight(input, 1.0)
-	if ok {
-		result.Weight = ptrFloat(weight)
+	// 启发式权重 (CalculateWeight): 作为无模型时的打分
+	heuristicWeight, _ := smart.CalculateWeight(input, 1.0)
+
+	var weight float64
+	if useLightGBM {
+		model := lightgbm.GetModel()
+		if w, ok := model.PredictWeight(input, 1.0); ok {
+			weight = w
+		} else {
+			weight = heuristicWeight
+		}
+	} else {
+		weight = heuristicWeight
 	}
+	result.Weight = ptrFloat(weight)
 }
 
-// probeViaMihomo 通过 mihomo 库建立真实代理隧道，测量经代理访问目标的指标。
-func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, timeout time.Duration, samples int, probeURL string) {
-	proxy, err := adapter.ParseProxy(cfg)
-	if err != nil {
-		log.Printf("节点 %s 解析失败: %v", req.NodeID, err)
-		return // success=false
+// collectSiteTrainingSample 为单个目标站点采集一条训练样本, 使 host/geoip 特征随站点
+// 变化 (融入 simulate_traffic 的多站点真实流量思路)。30 个特征由 mihomo 的
+// prepareFeatures 计算, 权重标签用 CalculateWeight 启发式, 写入 smart_weight_data.csv。
+func collectSiteTrainingSample(meta *C.Metadata, nodeName string, success, failure int64, latencyMS, loss float64, protocol string) {
+	collector := lightgbm.GetCollector()
+	if collector == nil {
+		return
 	}
+	isUDP := protocol == "hysteria" || protocol == "hysteria2"
+	connectTime := int64(1)
+	if success == 0 {
+		connectTime = 0 // 站点完全不可达 -> 触发 CalculateWeight 的失败默认值
+	}
+	input := &smart.ModelInput{
+		Success:          success,
+		Failure:          failure,
+		ConnectTime:      connectTime,
+		Latency:          int64(latencyMS),
+		IsUDP:            isUDP,
+		IsTCP:            !isUDP,
+		ConnectionFailed: success == 0 && failure > 0,
+		LossRate:         loss,
+		CumulLossRate:    loss,
+		DestPort:         meta.DstPort,
+		Host:             meta.Host,
+		NodeName:         nodeName,
+		GroupName:        "probe",
+	}
+	weight, _ := smart.CalculateWeight(input, 1.0)
+	collector.AddSample(input, meta, weight, "Traditional")
+}
 
-	u, _ := url.Parse(probeURL)
+// probeViaMihomo 通过 mihomo 库建立真实代理隧道，综合多个目标站点测量指标。
+// 对每个目标站点测延迟/丢包，汇总成综合指标；每个站点独立采集一条训练样本。
+func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, timeout time.Duration, samples int, probeURLs []string) {
+	// 主目标用于拨号建连与元数据
+	if len(probeURLs) == 0 {
+		probeURLs = []string{"https://www.gstatic.com/generate_204"}
+	}
+	u, _ := url.Parse(probeURLs[0])
 	dstHost := u.Hostname()
 	dstPort := uint16(443)
 	if u.Port() != "" {
@@ -320,21 +395,34 @@ func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, t
 			dstPort = uint16(p)
 		}
 	}
+	meta := &C.Metadata{NetWork: C.TCP, DstPort: dstPort, Host: dstHost}
 
-	// 1. 隧道连接建立耗时 (一次主动拨号)
+	proxy, err := adapter.ParseProxy(cfg)
+	if err != nil {
+		log.Printf("节点 %s 解析失败: %v", req.NodeID, err)
+		scoreNode(req.NodeID, req.Protocol, result, 0, 0, 0, meta, 0, 1)
+		return // success=false
+	}
+
+	// 1. 隧道连接建立耗时 (一次主动拨号到主目标)
 	dialStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	conn, err := proxy.DialContext(ctx, &C.Metadata{Host: dstHost, DstPort: dstPort})
 	cancel()
 	if err != nil {
 		log.Printf("节点 %s 隧道连接失败: %v", req.NodeID, err)
+		// 拨号失败: 记录一条失败训练样本 (host=主目标), 便于模型识别坏节点
+		if collectTraining {
+			collectSiteTrainingSample(meta, req.NodeID, 0, 1, 0, 1.0, req.Protocol)
+		}
+		scoreNode(req.NodeID, req.Protocol, result, 0, 0, 0, meta, 0, 1)
 		return // success=false
 	}
 	connectMS := float64(time.Since(dialStart).Microseconds()) / 1000.0
 	result.TCPConnectMS = &connectMS
 	conn.Close()
 
-	// 2. 通过隧道发 HTTP 请求测延迟/抖动/丢包
+	// 2. 通过隧道对每个目标站点测延迟/抖动/丢包, 汇总成综合指标
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
@@ -351,11 +439,29 @@ func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, t
 	}
 	client := &http.Client{Transport: transport, Timeout: timeout}
 
-	latencies := measureLatency(client, probeURL, samples)
-	if len(latencies) == 0 {
-		return // success=false
+	allLatencies := []float64{}
+	for _, pu := range probeURLs {
+		lats := measureLatency(client, pu, samples)
+		allLatencies = append(allLatencies, lats...)
+		// 每个站点采集一条训练样本 (host 特征随站点变化)
+		if collectTraining {
+			siteHost := hostOf(pu)
+			siteMeta := &C.Metadata{NetWork: C.TCP, DstPort: dstPort, Host: siteHost}
+			collectSiteTrainingSample(
+				siteMeta,
+				req.NodeID,
+				int64(len(lats)),
+				int64(samples-len(lats)),
+				avgFloat(lats),
+				float64(samples-len(lats))/float64(samples),
+				req.Protocol,
+			)
+		}
 	}
-	stats := computeLatencyStats(latencies, samples)
+	if len(allLatencies) == 0 {
+		return // 所有站点都无法到达 -> success=false
+	}
+	stats := computeLatencyStats(allLatencies, len(probeURLs)*samples)
 	result.LatencyMS = ptrFloat(stats.avg)
 	result.LatencyMinMS = ptrFloat(stats.min)
 	result.LatencyMaxMS = ptrFloat(stats.max)
@@ -365,33 +471,62 @@ func probeViaMihomo(cfg map[string]any, req ProbeRequest, result *ProbeResult, t
 	result.JitterMS = ptrFloat(stats.jitter)
 	result.SuccessRate = ptrFloat(stats.successRate)
 
-	// 3. 下载速度 + 首字节时间 (经隧道)
+	// 3. 下载速度 + 首字节时间 (遍历 download_urls, 取最大)
 	var downloadBytes int64
-	if req.DownloadURL != "" {
-		speed, firstByte, total := measureDownload(client, req.DownloadURL, timeout)
-		downloadBytes = total
-		if speed != nil {
-			result.DownloadSpeedKbps = speed
+	var bestDownload *float64
+	var firstByte *float64
+	for _, du := range req.DownloadURLs {
+		if du == "" {
+			continue
 		}
-		if firstByte != nil {
-			result.FirstByteMS = firstByte
+		speed, fb, total := measureDownload(client, du, timeout)
+		downloadBytes += total
+		if speed != nil && (bestDownload == nil || *speed > *bestDownload) {
+			bestDownload = speed
+		}
+		if fb != nil && firstByte == nil {
+			firstByte = fb
 		}
 	}
+	if bestDownload != nil {
+		result.DownloadSpeedKbps = bestDownload
+	}
+	if firstByte != nil {
+		result.FirstByteMS = firstByte
+	}
 
-	// 4. 上传速度 (经隧道)
+	// 4. 上传速度 (遍历 upload_urls, 取最大)
 	var uploadBytes int64
-	if req.UploadURL != "" {
-		speed, total := measureUpload(client, req.UploadURL, timeout)
-		uploadBytes = total
-		if speed != nil {
-			result.UploadSpeedKbps = speed
+	var bestUpload *float64
+	for _, uu := range req.UploadURLs {
+		if uu == "" {
+			continue
 		}
+		speed, total := measureUpload(client, uu, timeout)
+		uploadBytes += total
+		if speed != nil && (bestUpload == nil || *speed > *bestUpload) {
+			bestUpload = speed
+		}
+	}
+	if bestUpload != nil {
+		result.UploadSpeedKbps = bestUpload
 	}
 
 	result.Success = true
 
-	// 5. 用 mihomo smart 组件打分 (基于累积状态)
-	scoreNode(req.NodeID, req.Protocol, result, float64(downloadBytes), float64(uploadBytes), 0)
+	// 5. 用 mihomo smart 组件打分 (基于综合指标 + 累积状态)
+	successCount := int64(len(allLatencies))
+	failureCount := int64(len(probeURLs)*samples - len(allLatencies))
+	scoreNode(req.NodeID, req.Protocol, result, float64(downloadBytes), float64(uploadBytes), 0, meta, successCount, failureCount)
+}
+
+// hostOf 提取 URL 的 hostname。
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // measureLatency 通过给定 client 发送多次 HTTP 请求测量延迟，返回成功请求的延迟列表。
@@ -551,13 +686,27 @@ func jitter(vals []float64) float64 {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9100", "探针 HTTP 服务地址")
 	configPath := flag.String("config", "config/mihomo.yaml", "节点订阅文件路径 (用于 mihomo 隧道探测)")
-	modelDir := flag.String("model-dir", "", "mihomo smart 模型目录 (含 Model.bin，留空则用 CalculateWeight 启发式)")
+	modelDir := flag.String("model-dir", "", "smart 模型目录 (含 Model.bin 与 smart_weight_data.csv)")
+	useModelFlag := flag.Bool("use-model", true, "是否加载 Model.bin 打分 (false 则用 CalculateWeight 启发式)")
+	collectCSVFlag := flag.Bool("collect-csv", false, "是否采集训练数据到 <model-dir>/smart_weight_data.csv")
 	flag.Parse()
+
+	useLightGBM = *useModelFlag
+	collectTraining = *collectCSVFlag
 
 	// 设置 smart 模型目录 (若指定，则 smart 组件从 <dir>/Model.bin 加载模型)
 	if *modelDir != "" {
+		if err := os.MkdirAll(*modelDir, 0o755); err != nil {
+			log.Printf("创建模型目录失败: %v", err)
+		}
 		C.SetHomeDir(*modelDir)
 		log.Printf("smart 模型目录: %s", *modelDir)
+	}
+
+	// 初始化训练数据采集器 (默认 100MB 上限)
+	if collectTraining {
+		lightgbm.InitCollector(100)
+		log.Printf("训练数据采集已启用 -> <home>/smart_weight_data.csv")
 	}
 
 	// 加载节点订阅文件 (失败则退化为纯直连探测)

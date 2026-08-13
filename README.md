@@ -231,37 +231,153 @@ python scripts/train_smart.py --csv <home>/smart_weight_data.csv --output <home>
 脚本会计算 StandardScaler/RobustScaler 参数、训练 LightGBM 回归，并生成带
 `[transforms]` 段的模型文件 (mihomo 加载时自动应用缩放)。
 
-### 3. 验证模型
-
-```bash
-cd go && go run ./cmd/smart-verify <home>/Model.bin
-```
-
-验证模型能被 mihomo smart 组件解析并预测权重。
-
 > 说明: 训练数据来自**真实流量遥测** (流量 MB/时长/占比等)，需积累足够样本
 > (建议 ≥1000 条) 再训练。相关配置见 `config/mihomo-smart-proxy.yaml`。
 
-## Docker 部署
+### 用探针引擎采集 (推荐: 覆盖全部节点)
 
-单服务架构：`serve` 进程同时提供 HTTP 下载和 cron 定时 collect。
+真实流量采集只记录**被 SMART 组选中的节点**，未选中的节点永远没样本。要覆盖全部节点，
+可直接用**探针引擎**采集 (探针引擎并发对所有节点建真实隧道，不受选节点限制)：
+
+```yaml
+# config.yaml probe 段
+probe:
+  model_dir: models/smart        # 模型目录 (存放 smart_weight_data.csv 与 Model.bin)
+  collect_csv: true              # 开启探针训练数据采集
+  use_model: false               # 采集阶段先不加载模型打分
+```
 
 ```bash
-# 1. 准备配置
-cp config.example.yaml config/config.yaml   # 按需修改
+# 一键: 探针采集全部节点 + 训练自己的模型
+python scripts/collect_and_train.py --config config/config.yaml
 
-# 2. 构建并启动
+# 或手动分步: 先采集, 再(可选)与真实流量CSV合并, 再训练
+mihomo-smart --config config/config.yaml collect   # probe_all 全部节点 -> models/smart/smart_weight_data.csv
+python scripts/train_smart.py --csv models/smart/smart_weight_data.csv \
+    --extra-csv <真实流量采集的CSV> --output models/smart/Model.bin
+```
+
+训练完成后把 `probe.use_model` 改回 `true`，探针引擎即用**你自己训练的模型**打分，
+彻底摆脱预训练 `Model.bin`。
+
+> 注: 探针采集的 30 个特征由 mihomo `prepareFeatures` 计算，权重标签用
+> `CalculateWeight` 启发式 (与真实流量采集标签语义一致)。失败节点也会记录样本
+> (weight≈0)，便于模型识别坏节点。
+
+### 多目标综合打分 (融入 simulate_traffic 思路)
+
+探针不再只测单一目标，而是综合**多个真实站点**打分。配置 `probe.probe_urls` 列表，
+探针会并发对所有节点、对每个站点建真实隧道测延迟/丢包，汇总成综合指标
+(综合延迟 = 各站点平均值，成功率 = 各站点总体可达率)，并**每个站点各采一条训练样本**
+(host/geoip 特征随站点变化，让模型学到目标多样性)。
+
+```yaml
+probe:
+  probe_urls:                       # 综合多个站点打分
+    - "https://www.gstatic.com/generate_204"
+    - "https://www.google.com/generate_204"
+    - "https://www.youtube.com"
+    - "https://github.com"
+    - "https://www.cloudflare.com"
+    - "https://www.wikipedia.org"
+    - "https://www.microsoft.com"
+  download_urls: []                 # 下载测速 URL 列表 (留空跳过)
+  upload_urls: []                   # 上传测速 URL 列表 (留空跳过)
+```
+
+## Docker 部署
+
+单服务架构：`serve` 进程同时提供 HTTP 下载、cron 定时 `collect`（多站点探针采集）和
+在线学习。训练自己的 smart 模型也可在容器内完成。
+
+```bash
+# 1. 准备配置 (按需修改, 见下方要点)
+cp config.example.yaml config/config.yaml
+
+# 2. 准备环境变量 (按需修改端口/目录/时区)
+cp .env.example .env
+
+# 3. 构建并启动 (默认启动 serve, 带健康检查)
 docker compose up -d --build
 
-# 3. 查看日志
+# 4. 查看状态与日志 (serve 显示 healthy 即就绪)
+docker compose ps
 docker compose logs -f
 
-# 4. 下载产物
+# 5. 下载产物
 curl -O http://localhost:8000/download/smart
 curl -O http://localhost:8000/download/model
 ```
 
-数据通过挂载卷持久化：`./config`、`./data`、`./models`。
+### 环境变量 (.env)
+
+```bash
+# .env (由 .env.example 复制而来)
+MIIHOMO_SMART_PORT=8000          # 宿主机端口 (容器内固定 8000)
+MIIHOMO_SMART_CONTAINER=mihomo-smart
+SMART_CONFIG_DIR=./config        # 数据挂载目录
+SMART_DATA_DIR=./data
+SMART_MODELS_DIR=./models
+TZ=Asia/Shanghai                # 容器时区
+```
+
+> 健康检查: `serve` 每隔 30s 探测容器内 `http://127.0.0.1:8000/health`，
+> `docker compose ps` 中 `STATUS` 显示 `(healthy)` 即服务就绪。
+
+### 配置要点 (config.yaml)
+
+```yaml
+probe:
+  probe_urls:                     # 多站点综合探测打分
+    - "https://www.gstatic.com/generate_204"
+    - "https://www.google.com/generate_204"
+    - "https://www.youtube.com"
+    - "https://github.com"
+    - "https://www.cloudflare.com"
+    - "https://www.wikipedia.org"
+    - "https://www.microsoft.com"
+  model_dir: models/smart         # 模型目录 (容器内 /app/models/smart, 即宿主 ./models/smart)
+  use_model: true                 # 用自己训练的 Model.bin 打分
+  collect_csv: false              # 训练阶段改为 true 以采集数据
+
+collect:
+  schedule: "0 * * * *"           # 每小时跑一次 collect (多站点探测采集)
+  smart_auto_train: true          # 采集完成后自动重训 smart 模型
+  smart_min_samples: 1000         # 样本数达到该值才自动训练
+  smart_interval_hours: 24        # 自动重训间隔 (小时)
+```
+
+### 训练自己的模型 (在容器内)
+
+**方式 A: 全自动 (推荐)**
+
+```yaml
+# config.yaml
+probe:
+  collect_csv: true        # 开启采集
+  model_dir: models/smart
+collect:
+  smart_auto_train: true   # 每次 collect 后自动检查并重训
+```
+
+`serve` 的 cron 每小时跑一次 collect：多站点探测全部节点、把数据追加到
+`./models/smart/smart_weight_data.csv`；当样本数 ≥ `smart_min_samples` 且距上次训练
+超过 `smart_interval_hours` 时，自动训练 `Model.bin`。无需手动干预。
+
+**方式 B: 手动**
+
+```bash
+# 1. 开启采集 (config.yaml 设 probe.collect_csv: true), 重启 serve
+# 2. 运行一次性训练服务 (从采集数据训练 Model.bin)
+docker compose run --rm train
+# 3. 把 probe.use_model 改回 true 并重启
+```
+
+数据通过挂载卷持久化：`./config`、`./data`、`./models`（训练目录 `./models/smart`）。
+
+> 说明: 用探针采集覆盖全部节点、多站点综合打分，不需要逐个手动切换节点。训练数据
+> (smart_weight_data.csv) 与模型 (Model.bin) 均存放在挂载卷里，升级容器不丢失。
+> 自动训练在 collect 进程内完成，训练失败/样本不足不会中断 serve。
 
 ## 许可证
 
