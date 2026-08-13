@@ -1,13 +1,10 @@
 name: Build & Push Docker Image
 
 on:
+  # 仅在推送 tag (v*) 时触发 CI + 构建镜像
   push:
-    branches:
-      - main
-      - master
     tags:
       - "v*"
-  pull_request:
   workflow_dispatch:
 
 env:
@@ -77,19 +74,18 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      # PR 只构建验证, 不推送; push/tag 才推送到 GHCR
+      # 仅在推送 tag 时触发, 总是推送到 GHCR
       - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
