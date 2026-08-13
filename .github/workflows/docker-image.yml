@@ -38,7 +38,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --frozen --extra dev   # --extra dev 安装 ruff/pytest/pyright
 
       - name: Lint (ruff)
         run: uv run ruff check src/ tests/
